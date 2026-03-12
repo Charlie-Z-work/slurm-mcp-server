@@ -1,0 +1,32 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - HPC_HOST
+      - HPC_USER
+      - SLURM_ACCOUNT
+    properties:
+      HPC_HOST:
+        type: string
+        description: SSH host alias or hostname for your HPC cluster
+      HPC_USER:
+        type: string
+        description: Your username on the HPC cluster
+      SLURM_ACCOUNT:
+        type: string
+        description: SLURM account/allocation for job submission
+      HPC_PREAMBLE:
+        type: string
+        description: Shell commands to run before job scripts (module loads, conda activate, etc.)
+  commandFunction: |-
+    (config) => ({
+      command: 'npx',
+      args: ['-y', 'slurm-mcp-server'],
+      env: {
+        HPC_HOST: config.HPC_HOST,
+        HPC_USER: config.HPC_USER,
+        SLURM_ACCOUNT: config.SLURM_ACCOUNT,
+        ...(config.HPC_PREAMBLE ? { HPC_PREAMBLE: config.HPC_PREAMBLE } : {})
+      }
+    })

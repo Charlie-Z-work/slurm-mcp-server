@@ -29,6 +29,7 @@ function requireEnv(name) {
 
 // --- Optional env vars ---
 const HPC_PREAMBLE = process.env.HPC_PREAMBLE || null;
+const NOTIFY_WEBHOOK = process.env.NOTIFY_WEBHOOK || null; // Slack/Discord webhook URL
 
 // --- TTY detection (per-window identity) ---
 let windowTty = 'unknown';
@@ -205,6 +206,18 @@ function markCompleted(watch, state) {
     logDebug(`Desktop notification failed: ${err.message}`);
   }
 
+  // Webhook notification (Slack, Discord, etc.)
+  if (NOTIFY_WEBHOOK) {
+    try {
+      const payload = JSON.stringify({ text: msg, content: msg }); // text=Slack, content=Discord
+      execFileSync('curl', ['-s', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', payload, NOTIFY_WEBHOOK], {
+        timeout: 5000, stdio: 'ignore',
+      });
+    } catch (err) {
+      logDebug(`Webhook notification failed: ${err.message}`);
+    }
+  }
+
   // MCP logging notification — attempt to push into Claude Code conversation
   try {
     if (server?.server?.sendLoggingMessage) {
@@ -324,9 +337,30 @@ function startWatchPolling() {
   })();
 }
 
-const SSH_HOST = requireEnv('HPC_HOST');
-const SSH_USER = requireEnv('HPC_USER');
-const SLURM_ACCOUNT = requireEnv('SLURM_ACCOUNT');
+// --- Multi-cluster: HPC_HOST can be comma-separated (e.g. "cluster1,cluster2") ---
+const HPC_HOSTS = requireEnv('HPC_HOST').split(',').map(s => s.trim());
+const HPC_USERS = requireEnv('HPC_USER').split(',').map(s => s.trim());
+const SLURM_ACCOUNTS = requireEnv('SLURM_ACCOUNT').split(',').map(s => s.trim());
+
+// Default to first cluster
+let SSH_HOST = HPC_HOSTS[0];
+let SSH_USER = HPC_USERS.length > 1 ? HPC_USERS[0] : HPC_USERS[0];
+let SLURM_ACCOUNT = SLURM_ACCOUNTS.length > 1 ? SLURM_ACCOUNTS[0] : SLURM_ACCOUNTS[0];
+
+function getClusterIndex(name) {
+  if (!name) return 0;
+  const idx = HPC_HOSTS.indexOf(name);
+  return idx >= 0 ? idx : 0;
+}
+
+function switchCluster(name) {
+  const idx = getClusterIndex(name);
+  SSH_HOST = HPC_HOSTS[idx];
+  SSH_USER = HPC_USERS[Math.min(idx, HPC_USERS.length - 1)];
+  SLURM_ACCOUNT = SLURM_ACCOUNTS[Math.min(idx, SLURM_ACCOUNTS.length - 1)];
+  return SSH_HOST;
+}
+
 const TIMEOUT = 30000;
 
 function exec(cmd, timeout = TIMEOUT) {
@@ -338,13 +372,31 @@ function sshExec(cmd, timeout = TIMEOUT) {
   // execFileSync bypasses local shell — the entire remote command is passed
   // as one SSH argument, so 'bash -c' correctly receives the full string.
   const escaped = cmd.replace(/'/g, "'\"'\"'");
+  const doExec = () => execFileSync('ssh', [SSH_HOST, `bash --login -c '${escaped}'`], {
+    timeout, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 5 * 1024 * 1024,
+  }).trim();
+
   try {
-    return execFileSync('ssh', [SSH_HOST, `bash --login -c '${escaped}'`], {
-      timeout, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 5 * 1024 * 1024,
-    }).trim();
+    return doExec();
   } catch (e) {
-    // Attach stderr to error message so callers can see remote errors
     const stderr = e.stderr ? String(e.stderr).trim() : '';
+    // Auto-reconnect on connection failure
+    if (stderr.includes('Connection closed') || stderr.includes('Connection reset') ||
+        stderr.includes('Connection refused') || stderr.includes('not a socket') ||
+        e.message?.includes('socket is not connected')) {
+      logDebug(`SSH connection lost, attempting reconnect to ${SSH_HOST}...`);
+      try {
+        // Kill stale ControlMaster and establish new connection
+        try { execSync(`ssh -O exit ${SSH_HOST} 2>/dev/null`, { timeout: 3000, stdio: 'ignore' }); } catch {}
+        execSync(`ssh -fN ${SSH_HOST}`, { timeout: 15000, stdio: 'ignore' });
+        logDebug('SSH reconnected, retrying command...');
+        return doExec();
+      } catch (reconErr) {
+        e.message = `SSH reconnect failed: ${String(reconErr?.message ?? reconErr)}\nOriginal: ${e.message}`;
+        if (stderr) e.message += `\nSTDERR: ${stderr}`;
+        throw e;
+      }
+    }
     if (stderr) e.message = `${e.message}\nSTDERR: ${stderr}`;
     throw e;
   }
@@ -352,8 +404,8 @@ function sshExec(cmd, timeout = TIMEOUT) {
 
 const server = new McpServer({
   name: 'slurm-mcp-server',
-  version: '1.0.0',
-  instructions: 'SLURM HPC tools via SSH. Requires SSH ControlMaster (or key-based auth). Use resource_check before submitting jobs.',
+  version: '2.0.0',
+  instructions: 'SLURM HPC tools via SSH. 25+ tools for job management, file sync, monitoring, and interactive sessions. Supports multi-cluster setups.',
 });
 
 // --- Auto-prepend SLURM notifications to all tool results (piggyback) ---
@@ -523,6 +575,43 @@ server.tool('workdir_get', 'Get HPC working directory for this window', {}, asyn
   return { content: [{ type: 'text', text: `窗口: ${windowTty}\n工作目录: ${wd}` }] };
 });
 
+// --- Job Templates ---
+const TEMPLATES_FILE = join(homedir(), '.claude', 'slurm-templates.json');
+
+function loadTemplates() {
+  try { return JSON.parse(readFileSync(TEMPLATES_FILE, 'utf-8')); } catch { return {}; }
+}
+function saveTemplates(t) {
+  mkdirSync(join(homedir(), '.claude'), { recursive: true });
+  writeFileSync(TEMPLATES_FILE, JSON.stringify(t, null, 2));
+}
+
+server.tool('template_save', 'Save a reusable SLURM job template', {
+  name: z.string().describe('Template name (e.g. "gpu-a100", "cpu-quick")'),
+  partition: z.string().optional(),
+  gpus: z.number().optional(),
+  mem: z.string().optional(),
+  time: z.string().optional(),
+  cpus_per_task: z.number().optional(),
+  preamble: z.string().optional().describe('Extra shell commands before the main script'),
+}, async (args) => {
+  const templates = loadTemplates();
+  const { name, ...config } = args;
+  // Remove undefined values
+  Object.keys(config).forEach(k => config[k] === undefined && delete config[k]);
+  templates[name] = config;
+  saveTemplates(templates);
+  return { content: [{ type: 'text', text: `Template "${name}" saved: ${JSON.stringify(config)}` }] };
+});
+
+server.tool('template_list', 'List saved SLURM job templates', {}, async () => {
+  const templates = loadTemplates();
+  const names = Object.keys(templates);
+  if (!names.length) return { content: [{ type: 'text', text: 'No templates saved. Use template_save to create one.' }] };
+  const lines = names.map(n => `  ${n}: ${JSON.stringify(templates[n])}`);
+  return { content: [{ type: 'text', text: `Saved templates:\n${lines.join('\n')}` }] };
+});
+
 // --- SLURM ---
 
 // Validate SLURM job ID: digits only, optionally with _ for array jobs (e.g. "12345_1")
@@ -647,7 +736,22 @@ server.tool('slurm_submit', 'Submit a SLURM batch job (auto-checks resource hist
   time: z.string().optional().default('00:15:00').describe('HH:MM:SS'),
   cpus_per_task: z.number().optional(),
   output_dir: z.string().optional().default('results/logs'),
+  array: z.string().optional().describe('SLURM array spec (e.g. "1-10", "1-100%5")'),
+  template: z.string().optional().describe('Name of saved template to use as defaults'),
 }, async (args) => {
+  // Apply template defaults
+  if (args.template) {
+    const templates = loadTemplates();
+    const tmpl = templates[args.template];
+    if (tmpl) {
+      if (tmpl.partition && args.partition === 'batch') args.partition = tmpl.partition;
+      if (tmpl.gpus != null && args.gpus === 1) args.gpus = tmpl.gpus;
+      if (tmpl.mem && args.mem === '4G') args.mem = tmpl.mem;
+      if (tmpl.time && args.time === '00:15:00') args.time = tmpl.time;
+      if (tmpl.cpus_per_task && !args.cpus_per_task) args.cpus_per_task = tmpl.cpus_per_task;
+    }
+  }
+
   // Auto-check resource history before submitting
   let resourceInfo = '';
   try {
@@ -701,6 +805,7 @@ server.tool('slurm_submit', 'Submit a SLURM batch job (auto-checks resource hist
   ];
   if (args.gpus != null && args.gpus > 0) lines.push(`#SBATCH --gres=gpu:${args.gpus}`);
   if (args.cpus_per_task) lines.push(`#SBATCH --cpus-per-task=${args.cpus_per_task}`);
+  if (args.array) lines.push(`#SBATCH --array=${args.array}`);
   if (HPC_PREAMBLE) {
     lines.push('', ...HPC_PREAMBLE.split('\n'));
   }
@@ -740,6 +845,49 @@ server.tool('slurm_cancel', 'Cancel a SLURM job', {
   }
 });
 
+server.tool('slurm_logs', 'Read SLURM job output log', {
+  job_id: z.string().describe('Job ID'),
+  lines: z.number().optional().default(50).describe('Number of lines to read (default 50, use 0 for all)'),
+}, async (args) => {
+  try {
+    const jid = validateJobId(args.job_id);
+    // Find the log file via sacct
+    const stdoutPath = sshExec(`sacct -j ${jid} --format=StdOut%-200 -P -n | head -1`, 10000).trim();
+    if (!stdoutPath || stdoutPath === '|') {
+      return { content: [{ type: 'text', text: `No log file found for job ${jid}. Job may still be pending.` }] };
+    }
+    const cmd = args.lines === 0 ? `cat ${stdoutPath}` : `tail -n ${args.lines} ${stdoutPath}`;
+    const out = sshExec(cmd, 15000);
+    return { content: [{ type: 'text', text: out || '(empty log)' }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `Log read failed: ${String(e?.message ?? e)}` }], isError: true };
+  }
+});
+
+server.tool('slurm_submit_file', 'Submit an existing .slurm/.sh script file on HPC', {
+  path: z.string().describe('Absolute path to the .slurm/.sh file on HPC'),
+}, async (args) => {
+  try {
+    // Basic path validation
+    if (!args.path.startsWith('/')) {
+      return { content: [{ type: 'text', text: 'Path must be absolute' }], isError: true };
+    }
+    const out = sshExec(`sbatch ${args.path.replace(/'/g, "'\\''")}`, 60000);
+
+    // Register watch if job submitted
+    const jobMatch = out.match(/Submitted batch job (\d+)/);
+    if (jobMatch) {
+      const jobId = jobMatch[1];
+      const jobName = args.path.split('/').pop() || 'script-job';
+      registerWatch(jobId, jobName, 3600, 'batch');
+      return { content: [{ type: 'text', text: `${out}\n👁️ Watch registered: job ${jobId}` }] };
+    }
+    return { content: [{ type: 'text', text: out }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `Submit failed: ${String(e?.message ?? e)}` }], isError: true };
+  }
+});
+
 server.tool('cluster_info', 'Get HPC cluster partitions and status', {}, async () => {
   try {
     const host = sshExec('hostname', 10000);
@@ -755,9 +903,99 @@ server.tool('cluster_info', 'Get HPC cluster partitions and status', {}, async (
       '=== Your Jobs ===',
       jobs || '(no output)',
     ].join('\n');
-    return { content: [{ type: 'text', text: out }] };
+
+    // Queue wait estimation
+    let queueInfo = '';
+    try {
+      const pending = sshExec(`squeue -t PENDING -h | wc -l`, 10000).trim();
+      const running = sshExec(`squeue -t RUNNING -h | wc -l`, 10000).trim();
+      queueInfo = `\n=== Queue Estimate ===\nRunning: ${running} jobs\nPending: ${pending} jobs`;
+      if (parseInt(pending) > 50) queueInfo += '\n⚠️ High queue load — expect longer wait times';
+    } catch { /* non-fatal */ }
+
+    return { content: [{ type: 'text', text: out + queueInfo }] };
   } catch (e) {
     return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true };
+  }
+});
+
+server.tool('cluster_switch', 'Switch active HPC cluster (when multiple clusters configured)', {
+  host: z.string().optional().describe('Cluster host name to switch to. Omit to list available clusters.'),
+}, async (args) => {
+  if (!args.host) {
+    const list = HPC_HOSTS.map((h, i) => `  ${h === SSH_HOST ? '→' : ' '} ${h}${i === 0 ? ' (default)' : ''}`).join('\n');
+    return { content: [{ type: 'text', text: `Available clusters:\n${list}\n\nActive: ${SSH_HOST}` }] };
+  }
+  if (!HPC_HOSTS.includes(args.host)) {
+    return { content: [{ type: 'text', text: `Unknown cluster: ${args.host}. Available: ${HPC_HOSTS.join(', ')}` }], isError: true };
+  }
+  const switched = switchCluster(args.host);
+  return { content: [{ type: 'text', text: `Switched to cluster: ${switched}` }] };
+});
+
+server.tool('resource_report', 'Summarize resource usage over a time period', {
+  days: z.number().optional().default(7).describe('Number of days to look back (default 7)'),
+  format: z.enum(['text', 'csv']).optional().default('text'),
+}, async (args) => {
+  try {
+    const raw = sshExec(
+      `sacct -u ${SSH_USER} --format=JobID%-20,JobName%-30,Partition,Elapsed,MaxRSS,ReqMem,ReqTRES,State -P -S $(date -d '${args.days} days ago' +%Y-%m-%d) -n`,
+      20000
+    );
+    if (!raw) return { content: [{ type: 'text', text: 'No jobs found in the specified period.' }] };
+
+    const lines = raw.split('\n').filter(l => l.trim());
+    let totalJobs = 0, completed = 0, failed = 0;
+    let totalTimeSec = 0, maxMemGB = 0, gpuJobs = 0;
+
+    for (const line of lines) {
+      const parts = line.split('|');
+      const state = parts[7] || '';
+      if (parts[0]?.includes('.')) continue; // skip sub-steps
+      totalJobs++;
+      if (state === 'COMPLETED') completed++;
+      if (state === 'FAILED' || state === 'TIMEOUT' || state === 'OUT_OF_MEMORY') failed++;
+      // Parse elapsed
+      const elapsed = parts[3] || '';
+      const dayMatch = elapsed.match(/^(\d+)-(\d+):(\d+):(\d+)$/);
+      if (dayMatch) {
+        totalTimeSec += parseInt(dayMatch[1]) * 86400 + parseInt(dayMatch[2]) * 3600 + parseInt(dayMatch[3]) * 60 + parseInt(dayMatch[4]);
+      } else {
+        const [h, m, s] = elapsed.split(':').map(Number);
+        if (!isNaN(h)) totalTimeSec += h * 3600 + m * 60 + s;
+      }
+      // Parse memory
+      const rss = parts[4] || '';
+      if (rss.endsWith('K')) maxMemGB = Math.max(maxMemGB, parseInt(rss) / 1024 / 1024);
+      else if (rss.endsWith('M')) maxMemGB = Math.max(maxMemGB, parseInt(rss) / 1024);
+      else if (rss.endsWith('G')) maxMemGB = Math.max(maxMemGB, parseFloat(rss));
+      // GPU
+      if ((parts[6] || '').includes('gpu')) gpuJobs++;
+    }
+
+    const totalH = (totalTimeSec / 3600).toFixed(1);
+    const gpuH = gpuJobs > 0 ? `${(totalTimeSec / 3600 * gpuJobs / totalJobs).toFixed(1)}h (estimated)` : 'N/A';
+
+    if (args.format === 'csv') {
+      return { content: [{ type: 'text', text: raw }] };
+    }
+
+    const report = [
+      `📊 Resource Report (last ${args.days} days)`,
+      ``,
+      `Jobs: ${totalJobs} total, ${completed} completed, ${failed} failed`,
+      `Total compute time: ${totalH} hours`,
+      `GPU jobs: ${gpuJobs}`,
+      `Peak memory: ${maxMemGB.toFixed(1)} GB`,
+      ``,
+      `Recent jobs:`,
+      raw.split('\n').slice(0, 20).join('\n'),
+      lines.length > 20 ? `... (${lines.length - 20} more)` : '',
+    ].join('\n');
+
+    return { content: [{ type: 'text', text: report }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `Report failed: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
 
@@ -891,6 +1129,36 @@ server.tool('terminal_stop', 'Kill a tmux session', {
     const s = validateSession(args.session);
     tmuxExec(['kill-session', '-t', s]);
     return { content: [{ type: 'text', text: `Session "${s}" stopped` }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `Error: ${String(e?.message ?? e)}` }], isError: true };
+  }
+});
+
+server.tool('ssh_interactive', 'Start an interactive SSH session to HPC via tmux (for commands needing confirmation, 2FA, etc.)', {
+  command: z.string().optional().describe('Command to run after connecting (optional)'),
+  session: z.string().optional().default('hpc-interactive'),
+}, async (args) => {
+  try {
+    const s = validateSession(args.session);
+    // Kill existing session if any
+    try { tmuxExec(['kill-session', '-t', s], 3000); } catch { /* ignore */ }
+
+    // Start tmux with SSH
+    tmuxExec(['new-session', '-d', '-s', s, `ssh ${SSH_HOST}`]);
+
+    // Wait for SSH to connect
+    await new Promise(r => setTimeout(r, 2000));
+    const initial = tmuxExec(['capture-pane', '-t', s, '-p', '-S', '-20']);
+
+    // Run command if provided
+    if (args.command) {
+      await new Promise(r => setTimeout(r, 1000));
+      tmuxExec(['send-keys', '-t', s, args.command, 'Enter']);
+      await new Promise(r => setTimeout(r, 1500));
+    }
+
+    const out = tmuxExec(['capture-pane', '-t', s, '-p', '-S', '-30']);
+    return { content: [{ type: 'text', text: `Interactive session "${s}" started on ${SSH_HOST}.\nUse terminal_read/terminal_send to interact.\n\n--- Current output ---\n${out}` }] };
   } catch (e) {
     return { content: [{ type: 'text', text: `Error: ${String(e?.message ?? e)}` }], isError: true };
   }

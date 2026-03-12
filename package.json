@@ -1,7 +1,7 @@
 {
   "name": "slurm-mcp-server",
-  "version": "1.0.4",
-  "description": "MCP server for SLURM HPC clusters — zero-dependency, single-file, TTY-aware job watching with desktop notifications",
+  "version": "2.0.0",
+  "description": "MCP server for SLURM HPC clusters — 25+ tools, multi-cluster, job templates, auto-reconnect, webhook notifications",
   "type": "module",
   "main": "index.mjs",
   "bin": {

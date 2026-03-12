@@ -125,7 +125,28 @@ Before submitting jobs, automatically queries `sacct` for historical resource us
 ### 📁 Workdir Guard
 Per-window working directory tracking prevents accidentally submitting jobs to wrong directories.
 
-## Tools (19)
+### 🌐 Multi-Cluster Support
+Configure multiple clusters with comma-separated `HPC_HOST`. Switch between them with `cluster_switch`.
+
+### 🔄 SSH Auto-Reconnect
+Detects dropped SSH connections and automatically re-establishes ControlMaster before retrying the command.
+
+### 📋 Job Templates
+Save and reuse common SLURM configurations (partition, GPU count, memory, time). Apply with `template: "my-template"` on submit.
+
+### 📊 Resource Report
+Summarize your compute usage over any time period — total jobs, compute hours, GPU jobs, peak memory.
+
+### 🪝 Webhook Notifications
+Send job completion alerts to Slack, Discord, or any webhook endpoint via `NOTIFY_WEBHOOK` env var.
+
+### 📄 Direct Script Submit
+Submit existing `.slurm`/`.sh` files on the cluster without rebuilding the script locally.
+
+### 🖥️ Interactive SSH
+Start a tmux-based interactive SSH session for commands needing 2FA, confirmation prompts, or long-running monitoring.
+
+## Tools (25)
 
 | Category | Tool | Description |
 |----------|------|-------------|
@@ -133,15 +154,22 @@ Per-window working directory tracking prevents accidentally submitting jobs to w
 | | `ssh_exec` | Execute command on HPC |
 | | `ssh_read_file` | Read file from HPC |
 | | `ssh_write_file` | Write file to HPC |
+| | `ssh_interactive` | Start interactive SSH session via tmux |
 | **SLURM** | `slurm_status` | Check job status |
-| | `slurm_submit` | Submit batch job |
+| | `slurm_submit` | Submit batch job (supports arrays + templates) |
+| | `slurm_submit_file` | Submit existing .slurm/.sh script |
 | | `slurm_cancel` | Cancel job |
+| | `slurm_logs` | Read job output log |
 | | `slurm_watches` | List active job watches |
 | | `resource_check` | Check historical resource usage |
-| | `cluster_info` | Get cluster info |
+| | `resource_report` | Summarize usage over time period |
+| | `cluster_info` | Get cluster info + queue estimate |
+| | `cluster_switch` | Switch active cluster |
 | **Files** | `sync_files` | rsync between local and HPC |
 | **Workdir** | `workdir_set` | Set working directory |
 | | `workdir_get` | Get working directory |
+| **Templates** | `template_save` | Save reusable job template |
+| | `template_list` | List saved templates |
 | **Terminal** | `terminal_start` | Start tmux session |
 | | `terminal_read` | Read tmux output |
 | | `terminal_send` | Send keys to tmux |
@@ -157,6 +185,7 @@ Per-window working directory tracking prevents accidentally submitting jobs to w
 | `HPC_USER` | ✅ | Username on HPC cluster |
 | `SLURM_ACCOUNT` | ✅ | SLURM account for job submission |
 | `HPC_PREAMBLE` | ❌ | Shell commands to run before job scripts (module loads, conda activate, etc.) — newline-separated |
+| `NOTIFY_WEBHOOK` | ❌ | Slack/Discord webhook URL for job completion alerts |
 
 ## SSH Setup
 

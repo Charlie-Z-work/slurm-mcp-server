@@ -1,11 +1,11 @@
 {
   "name": "slurm-mcp-server",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server for SLURM HPC clusters — zero-dependency, single-file, TTY-aware job watching with desktop notifications",
   "type": "module",
   "main": "index.mjs",
   "bin": {
-    "slurm-mcp-server": "./index.mjs"
+    "slurm-mcp-server": "index.mjs"
   },
   "scripts": {
     "start": "node index.mjs"
@@ -23,7 +23,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Charlie-Z-work/slurm-mcp-server"
+    "url": "git+https://github.com/Charlie-Z-work/slurm-mcp-server.git"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

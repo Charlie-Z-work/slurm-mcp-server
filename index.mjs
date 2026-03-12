@@ -1261,3 +1261,4 @@ startWatchPolling();
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+// v2.0.1 — jury review fixes applied

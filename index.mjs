@@ -272,28 +272,48 @@ function startWatchPolling() {
     const completedIds = new Set();
     let stateChanged = false;
 
+    // Batch query: single sacct call for all watched jobs
+    const jobIds = myWatches.map(w => w.jobId).join(',');
+    let stateMap = new Map();
+    try {
+      const escaped = `sacct -j ${jobIds} --format=JobID%-20,State -P -n`.replace(/'/g, "'\"'\"'");
+      const { stdout } = await execFileAsync('ssh', [SSH_HOST, `bash --login -c '${escaped}'`], {
+        timeout: 15000, encoding: 'utf8',
+      });
+      for (const line of stdout.split('\n')) {
+        const [rawId, state] = line.split('|').map(s => s?.trim());
+        if (!rawId || !state) continue;
+        // sacct may return sub-job lines like "12345.batch" — use base job ID
+        const baseId = rawId.split('.')[0];
+        // Keep the first (main) state for each job
+        if (!stateMap.has(baseId)) stateMap.set(baseId, state);
+      }
+    } catch (err) {
+      lastPollError = `batch sacct: ${String(err?.message ?? err)}`;
+      logDebug(`Batch poll failed: ${String(err?.message ?? err)}`);
+      return; // Skip this cycle on failure
+    }
+
     for (const w of myWatches) {
-      try {
-        const state = await checkJobStateAsync(w.jobId);
-        if (TERMINAL_STATES.has(state)) {
-          markCompleted(w, state);
-          completedIds.add(w.jobId);
-        } else if (state !== 'UNKNOWN' && w.state !== state) {
-          w.state = state;
-          stateChanged = true;
-        }
-      } catch (err) {
-        lastPollError = `job ${w.jobId}: ${String(err?.message ?? err)}`;
-        logDebug(`Poll error for ${w.jobId}: ${String(err?.message ?? err)}`);
+      const state = stateMap.get(w.jobId) || 'UNKNOWN';
+      if (TERMINAL_STATES.has(state)) {
+        markCompleted(w, state);
+        completedIds.add(w.jobId);
+      } else if (state !== 'UNKNOWN' && w.state !== state) {
+        w.state = state;
+        stateChanged = true;
       }
     }
 
     if (completedIds.size || stateChanged) {
-      const updated = watches
+      // Re-read from disk to avoid overwriting watches added during async poll
+      const freshWatches = loadWatches();
+      const updated = freshWatches
         .filter(w => !completedIds.has(w.jobId))
         .map(w => {
-          const mine = myWatches.find(m => m.jobId === w.jobId);
-          return mine || w;
+          // Apply state updates from this poll cycle
+          const polled = myWatches.find(m => m.jobId === w.jobId);
+          return polled || w;
         });
       saveWatches(updated);
     }
@@ -317,12 +337,17 @@ function sshExec(cmd, timeout = TIMEOUT) {
   // Use login shell so /etc/profile.d/ (SLURM PATH etc.) is sourced
   // execFileSync bypasses local shell — the entire remote command is passed
   // as one SSH argument, so 'bash -c' correctly receives the full string.
-  // (execSync broke commands with flags like 'mkdir -p' because local sh
-  // stripped the quotes and SSH re-split the args)
   const escaped = cmd.replace(/'/g, "'\"'\"'");
-  return execFileSync('ssh', [SSH_HOST, `bash --login -c '${escaped}'`], {
-    timeout, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 5 * 1024 * 1024,
-  }).trim();
+  try {
+    return execFileSync('ssh', [SSH_HOST, `bash --login -c '${escaped}'`], {
+      timeout, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 5 * 1024 * 1024,
+    }).trim();
+  } catch (e) {
+    // Attach stderr to error message so callers can see remote errors
+    const stderr = e.stderr ? String(e.stderr).trim() : '';
+    if (stderr) e.message = `${e.message}\nSTDERR: ${stderr}`;
+    throw e;
+  }
 }
 
 const server = new McpServer({
@@ -500,13 +525,21 @@ server.tool('workdir_get', 'Get HPC working directory for this window', {}, asyn
 
 // --- SLURM ---
 
+// Validate SLURM job ID: digits only, optionally with _ for array jobs (e.g. "12345_1")
+const VALID_JOB_ID = /^\d+(_\d+)?$/;
+function validateJobId(id) {
+  if (!VALID_JOB_ID.test(id)) throw new Error(`Invalid job ID: ${id} (must be numeric, e.g. "12345" or "12345_1")`);
+  return id;
+}
+
 server.tool('slurm_status', 'Check SLURM job status', {
   job_id: z.string().optional().describe('Specific job ID, or omit for all your jobs'),
 }, async (args) => {
   try {
     if (args.job_id) {
-      const squeue = sshExec(`squeue -j ${args.job_id}`, 15000);
-      const sacct = sshExec(`sacct -j ${args.job_id}`, 15000);
+      const jid = validateJobId(args.job_id);
+      const squeue = sshExec(`squeue -j ${jid}`, 15000);
+      const sacct = sshExec(`sacct -j ${jid}`, 15000);
       const text = [
         '=== squeue ===',
         squeue || '(no output)',
@@ -526,10 +559,12 @@ server.tool('slurm_status', 'Check SLURM job status', {
 // --- Resource Check (MUST call before any sbatch) ---
 
 function queryResourceHistory(jobNamePattern, limit = 5) {
-  // Query sacct for recent completed jobs matching pattern
+  // Sanitize: only allow alphanumeric, dash, underscore, dot for grep -F
+  const safe = jobNamePattern.replace(/[^a-zA-Z0-9._-]/g, '');
+  if (!safe) return '';
   try {
     return sshExec(
-      `sacct -u ${SSH_USER} --format=JobID%-20,JobName%-20,Elapsed,MaxRSS,ReqMem,State -P -S $(date -d '7 days ago' +%Y-%m-%d) | grep COMPLETED | grep -i "${jobNamePattern}" | tail -${limit}`,
+      `sacct -u ${SSH_USER} --format=JobID%-20,JobName%-20,Elapsed,MaxRSS,ReqMem,State -P -S $(date -d '7 days ago' +%Y-%m-%d) | grep COMPLETED | grep -iF ${safe} | tail -${limit}`,
       15000
     );
   } catch { return ''; }
@@ -696,8 +731,9 @@ server.tool('slurm_cancel', 'Cancel a SLURM job', {
   job_id: z.string(),
 }, async (args) => {
   try {
-    const out = sshExec(`scancel ${args.job_id} && echo "Job ${args.job_id} cancelled"`);
-    removeWatch(args.job_id);
+    const jid = validateJobId(args.job_id);
+    const out = sshExec(`scancel ${jid} && echo "Job ${jid} cancelled"`);
+    removeWatch(jid);
     return { content: [{ type: 'text', text: out }] };
   } catch (e) {
     return { content: [{ type: 'text', text: `Cancel failed: ${e.message}` }], isError: true };
@@ -728,7 +764,7 @@ server.tool('cluster_info', 'Get HPC cluster partitions and status', {}, async (
 // --- File Sync ---
 
 // Path validation: block shell metacharacters and traversal
-const UNSAFE_PATH = /[;|$()&<>`\n\t\r]/;
+const UNSAFE_PATH = /[;|$()&<>`\n\t\r\\]/;
 function validatePath(p, label) {
   if (UNSAFE_PATH.test(p)) return `${label} contains unsafe characters`;
   if (p.includes('..')) return `${label} contains '..' (path traversal not allowed)`;
@@ -834,12 +870,13 @@ server.tool('terminal_send', 'Send keys to tmux session. No heredoc or multi-lin
 server.tool('terminal_exec', 'Run an INTERACTIVE command in tmux and return output. Only for interactive/monitoring use (top, watch, conda activate). For batch commands, use ssh_exec instead.', {
   session: z.string().optional().default('hpc'),
   command: z.string().describe('Shell command to run'),
-  wait: z.number().optional().default(1000).describe('Ms to wait for output (default 1000, use more for slow commands)'),
+  wait: z.number().optional().default(1000).describe('Ms to wait for output (default 1000, max 30000)'),
 }, async (args) => {
   try {
     const s = validateSession(args.session);
     tmuxExec(['send-keys', '-t', s, args.command, 'Enter']);
-    await new Promise(r => setTimeout(r, args.wait ?? 1000));
+    const wait = Math.min(args.wait ?? 1000, 30000); // cap at 30s
+    await new Promise(r => setTimeout(r, wait));
     const out = tmuxExec(['capture-pane', '-t', s, '-p', '-S', '-100']);
     return { content: [{ type: 'text', text: out || '(empty)' }] };
   } catch (e) {

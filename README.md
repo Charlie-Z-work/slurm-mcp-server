@@ -2,19 +2,14 @@
 
 A zero-dependency MCP server for SLURM HPC clusters. Single file, `npx`-ready.
 
-## Why This?
+## Highlights
 
-Other SLURM MCP tools (slurm_mcp: 34 tools, hpcGPT: 40+) are feature-heavy but hard to set up. This server focuses on **what actually matters**:
-
-| Feature | slurm-mcp-server | slurm_mcp | hpcGPT |
-|---------|:---:|:---:|:---:|
-| Single file, zero config | ✅ | ❌ | ❌ |
-| `npx` install | ✅ | ❌ | ❌ |
-| TTY-aware job watching | ✅ | ❌ | ❌ |
-| Command Guard (SSH escape trap prevention) | ✅ | ❌ | ❌ |
-| Desktop notifications (macOS + Linux) | ✅ | ❌ | ❌ |
-| Resource waste prevention | ✅ | ❌ | ❌ |
-| Docker required | ❌ | ✅ | ✅ |
+- **Single file, zero config** — `npx slurm-mcp-server` and you're done
+- **TTY-aware job watching** — each terminal window tracks its own jobs, no cross-talk
+- **Command Guard** — blocks 7 categories of SSH escape traps that silently corrupt commands
+- **Desktop notifications** — native alerts on macOS and Linux when jobs finish
+- **Resource waste prevention** — checks historical usage before submitting, warns on over-allocation
+- **No Docker required** — runs directly on your machine via SSH
 
 ## Quick Start (3 steps)
 

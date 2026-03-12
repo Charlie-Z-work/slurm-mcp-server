@@ -1,6 +1,6 @@
 {
   "name": "slurm-mcp-server",
-  "version": "1.0.2",
+  "version": "1.0.4",
   "description": "MCP server for SLURM HPC clusters — zero-dependency, single-file, TTY-aware job watching with desktop notifications",
   "type": "module",
   "main": "index.mjs",
@@ -15,9 +15,12 @@
     "slurm",
     "hpc",
     "ssh",
-    "claude",
     "model-context-protocol",
-    "claude-code"
+    "claude-code",
+    "codex",
+    "cursor",
+    "openai",
+    "ai-coding"
   ],
   "author": "Charlie Z",
   "license": "MIT",

@@ -23,7 +23,10 @@ export SLURM_ACCOUNT=your-account   # SLURM account/allocation
 export HPC_PREAMBLE='module load python/3.11\nconda activate myenv'
 ```
 
-### 2. Add to Claude Code
+### 2. Add to your MCP client
+
+<details>
+<summary><b>Claude Code</b></summary>
 
 Add to your `.mcp.json`:
 
@@ -42,8 +45,61 @@ Add to your `.mcp.json`:
   }
 }
 ```
+</details>
 
-### 3. Restart Claude Code
+<details>
+<summary><b>OpenAI Codex CLI</b></summary>
+
+Add to your `~/.codex/config.json`:
+
+```json
+{
+  "mcpServers": {
+    "hpc": {
+      "command": "npx",
+      "args": ["-y", "slurm-mcp-server"],
+      "env": {
+        "HPC_HOST": "your-cluster",
+        "HPC_USER": "your-username",
+        "SLURM_ACCOUNT": "your-account"
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Cursor</b></summary>
+
+Add to `.cursor/mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "hpc": {
+      "command": "npx",
+      "args": ["-y", "slurm-mcp-server"],
+      "env": {
+        "HPC_HOST": "your-cluster",
+        "HPC_USER": "your-username",
+        "SLURM_ACCOUNT": "your-account"
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Other MCP clients</b></summary>
+
+This is a standard MCP server using stdio transport. Configure it in your client with:
+- **Command**: `npx -y slurm-mcp-server`
+- **Environment variables**: `HPC_HOST`, `HPC_USER`, `SLURM_ACCOUNT` (required), `HPC_PREAMBLE` (optional)
+</details>
+
+### 3. Restart your client
 
 That's it. SSH ControlMaster is recommended for persistent connections.
 

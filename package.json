@@ -1,6 +1,6 @@
 {
   "name": "slurm-mcp-server",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "MCP server for SLURM HPC clusters — 25+ tools, multi-cluster, job templates, auto-reconnect, webhook notifications",
   "type": "module",
   "main": "index.mjs",

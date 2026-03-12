@@ -501,7 +501,7 @@ server.tool('ssh_exec', 'Execute a command on HPC via SSH', {
     const text = args.verbose ? (out || '(no output)') : compressOutput(args.command, out);
     return { content: [{ type: 'text', text }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `SSH exec failed: ${e.message}` }], isError: true };
+    return { content: [{ type: 'text', text: `SSH exec failed: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
 
@@ -535,7 +535,7 @@ server.tool('ssh_write_file', 'Write content to a file on HPC. Use this instead 
     const bytes = Buffer.byteLength(fileContent, 'utf8');
     return { content: [{ type: 'text', text: `Written ${bytes} bytes → ${args.path} ${source}`.trim() }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `Write failed: ${e.message}` }], isError: true };
+    return { content: [{ type: 'text', text: `Write failed: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
 
@@ -551,7 +551,7 @@ server.tool('ssh_read_file', 'Read a file from HPC. Use this instead of ssh_exec
     const out = sshExec(cmd, 15000);
     return { content: [{ type: 'text', text: out || '(empty file)' }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `Read failed: ${e.message}` }], isError: true };
+    return { content: [{ type: 'text', text: `Read failed: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
 
@@ -641,7 +641,7 @@ server.tool('slurm_status', 'Check SLURM job status', {
     const out = sshExec(`squeue -u ${SSH_USER}`, 15000);
     return { content: [{ type: 'text', text: out || '(no jobs)' }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true };
+    return { content: [{ type: 'text', text: `Error: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
 
@@ -659,6 +659,17 @@ function queryResourceHistory(jobNamePattern, limit = 5) {
   } catch { return ''; }
 }
 
+/** Parse SLURM elapsed time: D-HH:MM:SS, HH:MM:SS, or MM:SS → seconds */
+function parseElapsed(s) {
+  if (!s) return 0;
+  const dayMatch = s.match(/^(\d+)-(\d+):(\d+):(\d+)$/);
+  if (dayMatch) return parseInt(dayMatch[1]) * 86400 + parseInt(dayMatch[2]) * 3600 + parseInt(dayMatch[3]) * 60 + parseInt(dayMatch[4]);
+  const parts = s.split(':').map(Number);
+  if (parts.length === 3) return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+  if (parts.length === 2) return (parts[0] || 0) * 60 + (parts[1] || 0);
+  return 0;
+}
+
 function parseResourceHistory(sacctOutput) {
   if (!sacctOutput) return null;
   const lines = sacctOutput.split('\n').filter(l => l.includes('COMPLETED'));
@@ -671,10 +682,10 @@ function parseResourceHistory(sacctOutput) {
     if (rss.endsWith('K')) maxMem = Math.max(maxMem, parseInt(rss) / 1024 / 1024); // → GB
     else if (rss.endsWith('M')) maxMem = Math.max(maxMem, parseInt(rss) / 1024);
     else if (rss.endsWith('G')) maxMem = Math.max(maxMem, parseFloat(rss));
-    // Parse Elapsed (HH:MM:SS)
+    // Parse Elapsed (HH:MM:SS or MM:SS or D-HH:MM:SS)
     const elapsed = parts[2] || '';
-    const [h, m, s] = elapsed.split(':').map(Number);
-    if (!isNaN(h)) maxTime = Math.max(maxTime, h * 3600 + m * 60 + s);
+    const secs = parseElapsed(elapsed);
+    if (secs > 0) maxTime = Math.max(maxTime, secs);
   }
   return { maxMemGB: maxMem, maxTimeSec: maxTime, count: lines.length };
 }
@@ -723,34 +734,32 @@ server.tool('resource_check', 'Check actual resource usage of past jobs (MUST ca
 
     return { content: [{ type: 'text', text: sections.join('\n\n') }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true };
+    return { content: [{ type: 'text', text: `Error: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
 
 server.tool('slurm_submit', 'Submit a SLURM batch job (auto-checks resource history)', {
   script: z.string().describe('Main command to run'),
-  job_name: z.string().optional().default('slurm-job'),
-  partition: z.string().optional().default('batch'),
-  gpus: z.number().optional().default(1).describe('Number of GPUs'),
-  mem: z.string().optional().default('4G'),
-  time: z.string().optional().default('00:15:00').describe('HH:MM:SS'),
+  job_name: z.string().optional().describe('Job name (default: slurm-job)'),
+  partition: z.string().optional().describe('Partition (default: batch)'),
+  gpus: z.number().optional().describe('Number of GPUs (default: 1)'),
+  mem: z.string().optional().describe('Memory (default: 4G)'),
+  time: z.string().optional().describe('Time limit HH:MM:SS (default: 00:15:00)'),
   cpus_per_task: z.number().optional(),
-  output_dir: z.string().optional().default('results/logs'),
+  output_dir: z.string().optional().describe('Log output dir (default: results/logs)'),
   array: z.string().optional().describe('SLURM array spec (e.g. "1-10", "1-100%5")'),
   template: z.string().optional().describe('Name of saved template to use as defaults'),
-}, async (args) => {
-  // Apply template defaults
-  if (args.template) {
+}, async (rawArgs) => {
+  // Defaults — template values override these, user explicit values override template
+  const DEFAULTS = { job_name: 'slurm-job', partition: 'batch', gpus: 1, mem: '4G', time: '00:15:00', output_dir: 'results/logs' };
+  // Apply template, then user values, on top of defaults
+  let tmplValues = {};
+  if (rawArgs.template) {
     const templates = loadTemplates();
-    const tmpl = templates[args.template];
-    if (tmpl) {
-      if (tmpl.partition && args.partition === 'batch') args.partition = tmpl.partition;
-      if (tmpl.gpus != null && args.gpus === 1) args.gpus = tmpl.gpus;
-      if (tmpl.mem && args.mem === '4G') args.mem = tmpl.mem;
-      if (tmpl.time && args.time === '00:15:00') args.time = tmpl.time;
-      if (tmpl.cpus_per_task && !args.cpus_per_task) args.cpus_per_task = tmpl.cpus_per_task;
-    }
+    const tmpl = templates[rawArgs.template];
+    if (tmpl) tmplValues = { ...tmpl };
   }
+  const args = { ...DEFAULTS, ...tmplValues, ...Object.fromEntries(Object.entries(rawArgs).filter(([, v]) => v !== undefined)) };
 
   // Auto-check resource history before submitting
   let resourceInfo = '';
@@ -828,7 +837,7 @@ server.tool('slurm_submit', 'Submit a SLURM batch job (auto-checks resource hist
     }
     return { content: [{ type: 'text', text: out + resourceInfo + workdirHint }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `Submit failed: ${e.message}` }], isError: true };
+    return { content: [{ type: 'text', text: `Submit failed: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
 
@@ -841,7 +850,7 @@ server.tool('slurm_cancel', 'Cancel a SLURM job', {
     removeWatch(jid);
     return { content: [{ type: 'text', text: out }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `Cancel failed: ${e.message}` }], isError: true };
+    return { content: [{ type: 'text', text: `Cancel failed: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
 
@@ -856,7 +865,11 @@ server.tool('slurm_logs', 'Read SLURM job output log', {
     if (!stdoutPath || stdoutPath === '|') {
       return { content: [{ type: 'text', text: `No log file found for job ${jid}. Job may still be pending.` }] };
     }
-    const cmd = args.lines === 0 ? `cat ${stdoutPath}` : `tail -n ${args.lines} ${stdoutPath}`;
+    if (UNSAFE_PATH.test(stdoutPath)) {
+      return { content: [{ type: 'text', text: `Suspicious log path from sacct: ${stdoutPath}` }], isError: true };
+    }
+    const quoted = `'${stdoutPath.replace(/'/g, "'\\''")}'`;
+    const cmd = args.lines === 0 ? `cat ${quoted}` : `tail -n ${args.lines} ${quoted}`;
     const out = sshExec(cmd, 15000);
     return { content: [{ type: 'text', text: out || '(empty log)' }] };
   } catch (e) {
@@ -872,7 +885,10 @@ server.tool('slurm_submit_file', 'Submit an existing .slurm/.sh script file on H
     if (!args.path.startsWith('/')) {
       return { content: [{ type: 'text', text: 'Path must be absolute' }], isError: true };
     }
-    const out = sshExec(`sbatch ${args.path.replace(/'/g, "'\\''")}`, 60000);
+    if (UNSAFE_PATH.test(args.path)) {
+      return { content: [{ type: 'text', text: 'Path contains unsafe characters' }], isError: true };
+    }
+    const out = sshExec(`sbatch '${args.path.replace(/'/g, "'\\''")}'`, 60000);
 
     // Register watch if job submitted
     const jobMatch = out.match(/Submitted batch job (\d+)/);
@@ -915,7 +931,7 @@ server.tool('cluster_info', 'Get HPC cluster partitions and status', {}, async (
 
     return { content: [{ type: 'text', text: out + queueInfo }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true };
+    return { content: [{ type: 'text', text: `Error: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
 
@@ -929,8 +945,17 @@ server.tool('cluster_switch', 'Switch active HPC cluster (when multiple clusters
   if (!HPC_HOSTS.includes(args.host)) {
     return { content: [{ type: 'text', text: `Unknown cluster: ${args.host}. Available: ${HPC_HOSTS.join(', ')}` }], isError: true };
   }
+  const prevHost = SSH_HOST;
   const switched = switchCluster(args.host);
-  return { content: [{ type: 'text', text: `Switched to cluster: ${switched}` }] };
+  let warning = '';
+  try {
+    const watches = JSON.parse(readFileSync(WATCH_FILE, 'utf8'));
+    const activeCount = Object.keys(watches).length;
+    if (activeCount > 0) {
+      warning = `\n⚠️ ${activeCount} active job watch(es) from ${prevHost} — they will continue polling the previous cluster.`;
+    }
+  } catch { /* no watches */ }
+  return { content: [{ type: 'text', text: `Switched to cluster: ${switched}${warning}` }] };
 });
 
 server.tool('resource_report', 'Summarize resource usage over a time period', {
@@ -957,13 +982,8 @@ server.tool('resource_report', 'Summarize resource usage over a time period', {
       if (state === 'FAILED' || state === 'TIMEOUT' || state === 'OUT_OF_MEMORY') failed++;
       // Parse elapsed
       const elapsed = parts[3] || '';
-      const dayMatch = elapsed.match(/^(\d+)-(\d+):(\d+):(\d+)$/);
-      if (dayMatch) {
-        totalTimeSec += parseInt(dayMatch[1]) * 86400 + parseInt(dayMatch[2]) * 3600 + parseInt(dayMatch[3]) * 60 + parseInt(dayMatch[4]);
-      } else {
-        const [h, m, s] = elapsed.split(':').map(Number);
-        if (!isNaN(h)) totalTimeSec += h * 3600 + m * 60 + s;
-      }
+      const secs = parseElapsed(elapsed);
+      if (secs > 0) totalTimeSec += secs;
       // Parse memory
       const rss = parts[4] || '';
       if (rss.endsWith('K')) maxMemGB = Math.max(maxMemGB, parseInt(rss) / 1024 / 1024);
@@ -1144,7 +1164,9 @@ server.tool('ssh_interactive', 'Start an interactive SSH session to HPC via tmux
     try { tmuxExec(['kill-session', '-t', s], 3000); } catch { /* ignore */ }
 
     // Start tmux with SSH
-    tmuxExec(['new-session', '-d', '-s', s, `ssh ${SSH_HOST}`]);
+    // SSH_HOST is from env var; validate to prevent injection if ever tainted
+    const safeHost = SSH_HOST.replace(/[^a-zA-Z0-9._-]/g, '');
+    tmuxExec(['new-session', '-d', '-s', s, `ssh ${safeHost}`]);
 
     // Wait for SSH to connect
     await new Promise(r => setTimeout(r, 2000));
@@ -1176,7 +1198,7 @@ server.tool('guide', 'Read the HPC guide (experiment workflow, data, SLURM templ
       `Pending notifications: ${myNotifs.length}`;
     return { content: [{ type: 'text', text: guide + watchSection }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `Cannot read guide: ${e.message}` }], isError: true };
+    return { content: [{ type: 'text', text: `Cannot read guide: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
 
@@ -1230,7 +1252,7 @@ server.tool('slurm_watches', 'List active SLURM job watches and pending notifica
 
     return { content: [{ type: 'text', text: parts.join('\n') }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `Error reading watches: ${e.message}` }], isError: true };
+    return { content: [{ type: 'text', text: `Error reading watches: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
 

@@ -189,6 +189,19 @@ function markCompleted(watch, state) {
   });
   saveNotifications(notifs);
 
+  // Update bridge file for cross-session notification (NanoClaw integration)
+  try {
+    const bridgeDir = join(homedir(), '.claude', 'bridges');
+    const bridgeFile = join(bridgeDir, `${watch.tty}.json`);
+    if (existsSync(bridgeFile)) {
+      const bridge = JSON.parse(readFileSync(bridgeFile, 'utf8'));
+      bridge.summary = `[HPC] ${msg}\n\n${bridge.summary || ''}`;
+      writeFileSync(bridgeFile, JSON.stringify(bridge, null, 2));
+    }
+  } catch (err) {
+    logDebug(`Bridge update failed for ${watch.tty}: ${String(err?.message ?? err)}`);
+  }
+
   // Cross-platform desktop notification
   try {
     const platform = process.platform;
@@ -715,19 +728,41 @@ function checkResourceWaste(requestedMem, requestedTime, hist) {
   return warnings.length ? '\n' + warnings.join('\n') : '';
 }
 
+// Optional: external resource log file (e.g. Python-generated TSV with persistent experiment metrics)
+const RESOURCE_LOG_PATH = process.env.HPC_RESOURCE_LOG || null;
+
+function queryResourceLog(pattern) {
+  if (!RESOURCE_LOG_PATH) return '';
+  const safe = pattern.replace(/[^a-zA-Z0-9._-]/g, '');
+  if (!safe) return '';
+  try {
+    return sshExec(`cat ${RESOURCE_LOG_PATH} 2>/dev/null | grep -iF ${safe} || true`, 10000);
+  } catch { return ''; }
+}
+
 server.tool('resource_check', 'Check actual resource usage of past jobs (MUST call before sbatch)', {
   job_name: z.string().describe('Job name pattern to search'),
 }, async (args) => {
   try {
+    const sections = [];
+
+    // Source 1: sacct (SLURM accounting)
     const sacctRaw = queryResourceHistory(args.job_name);
     const hist = sacctRaw ? parseResourceHistory(sacctRaw) : null;
 
-    if (!sacctRaw) {
+    // Source 2: external resource log (optional, set HPC_RESOURCE_LOG env var)
+    const logRaw = queryResourceLog(args.job_name);
+
+    if (!sacctRaw && !logRaw) {
       return { content: [{ type: 'text', text: `No resource data for "${args.job_name}". Run a 1-seed benchmark first.` }] };
     }
 
-    const sections = [];
-    sections.push(`=== SLURM sacct (last 7 days) ===\n${sacctRaw}`);
+    if (sacctRaw) {
+      sections.push(`=== SLURM sacct (last 7 days) ===\n${sacctRaw}`);
+    }
+    if (logRaw) {
+      sections.push(`=== External resource log ===\n${logRaw}`);
+    }
     if (hist) {
       sections.push(formatRecommendation(hist));
     }

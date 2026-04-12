@@ -861,8 +861,29 @@ server.tool('slurm_submit', 'Submit a SLURM batch job (auto-checks resource hist
   lines.push('', args.script);
   const sbatch = lines.join('\n');
   const mkdirTarget = outputDir.startsWith('/') ? outputDir : (storedWorkdir ? `${storedWorkdir}/${outputDir}` : outputDir);
+
+  // Validate output_dir before interpolating into any shell command.
+  const mkdirErr = validatePath(mkdirTarget, 'output_dir');
+  if (mkdirErr) return { content: [{ type: 'text', text: mkdirErr }], isError: true };
+
   try {
-    const out = sshExec(`mkdir -p ${mkdirTarget} && cat <<'SLURM_EOF' | sbatch\n${sbatch}\nSLURM_EOF`, 60000);
+    // Create output directory separately with a properly quoted path.
+    const safeMkdir = mkdirTarget.replace(/'/g, "'\"'\"'");
+    sshExec(`mkdir -p '${safeMkdir}'`, 30000);
+
+    // Submit via stdin instead of a heredoc.  If the script content contained the
+    // heredoc delimiter (SLURM_EOF) on its own line the heredoc would terminate
+    // early and the remainder of the string would execute as a bare shell command
+    // inside the SSH session.  Piping via execFileSync stdin is not subject to
+    // this attack: sbatch reads the script from stdin when invoked with no file
+    // argument, and the script bytes never pass through a shell interpreter.
+    const out = execFileSync('ssh', [SSH_HOST, 'bash', '--login', '-c', 'sbatch'], {
+      input: sbatch,
+      timeout: 60000,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      maxBuffer: 5 * 1024 * 1024,
+    }).trim();
 
     // Register SLURM watch for automatic monitoring
     const jobMatch = out.match(/Submitted batch job (\d+)/);

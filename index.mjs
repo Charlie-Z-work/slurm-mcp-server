@@ -401,9 +401,11 @@ function sshExec(cmd, timeout = TIMEOUT) {
         e.message?.includes('socket is not connected')) {
       logDebug(`SSH connection lost, attempting reconnect to ${SSH_HOST}...`);
       try {
-        // Kill stale ControlMaster and establish new connection
-        try { execSync(`ssh -O exit ${SSH_HOST} 2>/dev/null`, { timeout: 3000, stdio: 'ignore' }); } catch {}
-        execSync(`ssh -fN ${SSH_HOST}`, { timeout: 15000, stdio: 'ignore' });
+        // Kill stale ControlMaster and establish new connection.
+        // Use execFileSync so SSH_HOST is passed as a literal argument, not
+        // interpolated into a shell command string.
+        try { execFileSync('ssh', ['-O', 'exit', SSH_HOST], { timeout: 3000, stdio: 'ignore' }); } catch {}
+        execFileSync('ssh', ['-fN', SSH_HOST], { timeout: 15000, stdio: 'ignore' });
         logDebug('SSH reconnected, retrying command...');
         return doExec();
       } catch (reconErr) {

@@ -1009,7 +1009,7 @@ server.tool('cluster_switch', 'Switch active HPC cluster (when multiple clusters
   const switched = switchCluster(args.host);
   let warning = '';
   try {
-    const watches = JSON.parse(readFileSync(WATCH_FILE, 'utf8'));
+    const watches = JSON.parse(readFileSync(WATCHES_FILE, 'utf8'));
     const activeCount = Object.keys(watches).length;
     if (activeCount > 0) {
       warning = `\n⚠️ ${activeCount} active job watch(es) from ${prevHost} — they will continue polling the previous cluster.`;

@@ -206,12 +206,14 @@ function markCompleted(watch, state) {
   try {
     const platform = process.platform;
     if (platform === 'darwin') {
-      const safeMsg = msg.replace(/[\\"]/g, '\\$&');
-      execSync(`osascript -e 'display notification "${safeMsg}" with title "SLURM" sound name "Glass"'`,
+      // Use execFileSync (not execSync) so msg is passed as a literal argv element,
+      // preventing shell injection via job names containing single quotes.
+      const safeMsg = msg.replace(/[\\"]/g, '\\$&'); // escape for AppleScript string literal
+      execFileSync('osascript', ['-e', `display notification "${safeMsg}" with title "SLURM" sound name "Glass"`],
         { timeout: 5000, stdio: 'ignore' });
     } else if (platform === 'linux') {
-      const safeMsg = msg.replace(/'/g, "'\"'\"'");
-      execSync(`notify-send 'SLURM' '${safeMsg}'`,
+      // execFileSync passes args directly — no shell quoting needed.
+      execFileSync('notify-send', ['SLURM', msg],
         { timeout: 5000, stdio: 'ignore' });
     }
     // Windows/other: skip silently

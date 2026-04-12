@@ -206,12 +206,14 @@ function markCompleted(watch, state) {
   try {
     const platform = process.platform;
     if (platform === 'darwin') {
-      const safeMsg = msg.replace(/[\\"]/g, '\\$&');
-      execSync(`osascript -e 'display notification "${safeMsg}" with title "SLURM" sound name "Glass"'`,
+      // Use execFileSync (not execSync) so msg is passed as a literal argv element,
+      // preventing shell injection via job names containing single quotes.
+      const safeMsg = msg.replace(/[\\"]/g, '\\$&'); // escape for AppleScript string literal
+      execFileSync('osascript', ['-e', `display notification "${safeMsg}" with title "SLURM" sound name "Glass"`],
         { timeout: 5000, stdio: 'ignore' });
     } else if (platform === 'linux') {
-      const safeMsg = msg.replace(/'/g, "'\"'\"'");
-      execSync(`notify-send 'SLURM' '${safeMsg}'`,
+      // execFileSync passes args directly — no shell quoting needed.
+      execFileSync('notify-send', ['SLURM', msg],
         { timeout: 5000, stdio: 'ignore' });
     }
     // Windows/other: skip silently
@@ -399,9 +401,11 @@ function sshExec(cmd, timeout = TIMEOUT) {
         e.message?.includes('socket is not connected')) {
       logDebug(`SSH connection lost, attempting reconnect to ${SSH_HOST}...`);
       try {
-        // Kill stale ControlMaster and establish new connection
-        try { execSync(`ssh -O exit ${SSH_HOST} 2>/dev/null`, { timeout: 3000, stdio: 'ignore' }); } catch {}
-        execSync(`ssh -fN ${SSH_HOST}`, { timeout: 15000, stdio: 'ignore' });
+        // Kill stale ControlMaster and establish new connection.
+        // Use execFileSync so SSH_HOST is passed as a literal argument, not
+        // interpolated into a shell command string.
+        try { execFileSync('ssh', ['-O', 'exit', SSH_HOST], { timeout: 3000, stdio: 'ignore' }); } catch {}
+        execFileSync('ssh', ['-fN', SSH_HOST], { timeout: 15000, stdio: 'ignore' });
         logDebug('SSH reconnected, retrying command...');
         return doExec();
       } catch (reconErr) {
@@ -857,8 +861,29 @@ server.tool('slurm_submit', 'Submit a SLURM batch job (auto-checks resource hist
   lines.push('', args.script);
   const sbatch = lines.join('\n');
   const mkdirTarget = outputDir.startsWith('/') ? outputDir : (storedWorkdir ? `${storedWorkdir}/${outputDir}` : outputDir);
+
+  // Validate output_dir before interpolating into any shell command.
+  const mkdirErr = validatePath(mkdirTarget, 'output_dir');
+  if (mkdirErr) return { content: [{ type: 'text', text: mkdirErr }], isError: true };
+
   try {
-    const out = sshExec(`mkdir -p ${mkdirTarget} && cat <<'SLURM_EOF' | sbatch\n${sbatch}\nSLURM_EOF`, 60000);
+    // Create output directory separately with a properly quoted path.
+    const safeMkdir = mkdirTarget.replace(/'/g, "'\"'\"'");
+    sshExec(`mkdir -p '${safeMkdir}'`, 30000);
+
+    // Submit via stdin instead of a heredoc.  If the script content contained the
+    // heredoc delimiter (SLURM_EOF) on its own line the heredoc would terminate
+    // early and the remainder of the string would execute as a bare shell command
+    // inside the SSH session.  Piping via execFileSync stdin is not subject to
+    // this attack: sbatch reads the script from stdin when invoked with no file
+    // argument, and the script bytes never pass through a shell interpreter.
+    const out = execFileSync('ssh', [SSH_HOST, 'bash', '--login', '-c', 'sbatch'], {
+      input: sbatch,
+      timeout: 60000,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      maxBuffer: 5 * 1024 * 1024,
+    }).trim();
 
     // Register SLURM watch for automatic monitoring
     const jobMatch = out.match(/Submitted batch job (\d+)/);
@@ -984,7 +1009,7 @@ server.tool('cluster_switch', 'Switch active HPC cluster (when multiple clusters
   const switched = switchCluster(args.host);
   let warning = '';
   try {
-    const watches = JSON.parse(readFileSync(WATCH_FILE, 'utf8'));
+    const watches = JSON.parse(readFileSync(WATCHES_FILE, 'utf8'));
     const activeCount = Object.keys(watches).length;
     if (activeCount > 0) {
       warning = `\n⚠️ ${activeCount} active job watch(es) from ${prevHost} — they will continue polling the previous cluster.`;

@@ -154,7 +154,7 @@ function checkJobState(jobId) {
 async function checkJobStateAsync(jobId) {
   try {
     const escaped = `sacct -j ${jobId} --format=State -P -n | head -1`.replace(/'/g, "'\"'\"'");
-    const { stdout } = await execFileAsync('ssh', [SSH_HOST, `bash --login -c '${escaped}'`], {
+    const { stdout } = await execFileAsync('ssh', ['-o', 'BatchMode=yes', SSH_HOST, `bash --login -c '${escaped}'`], {
       timeout: 15000, encoding: 'utf8',
     });
     return stdout.split('\n')[0]?.trim() || 'UNKNOWN';
@@ -275,9 +275,32 @@ function formatWatchStatus(watches) {
 
 // Polling loop — async, non-blocking, per-tty filtering
 const POLL_INTERVAL = 30_000;
+const POLL_BACKOFF_MAX = 600_000; // 10 min cap under sustained failure
+let consecutivePollFailures = 0;
+
+function currentPollDelay() {
+  return Math.min(POLL_INTERVAL * 2 ** consecutivePollFailures, POLL_BACKOFF_MAX);
+}
+
+// Local-only liveness probe of the shared ControlMaster socket (no network,
+// no auth attempt). Chained MFA (publickey+Duo) means a background process
+// can NEVER re-authenticate — dead master ⇒ pause, tell the human.
+function masterAlive(host) {
+  try {
+    execSync(`ssh -O check ${host}`, { timeout: 3000, stdio: 'ignore' });
+    return true;
+  } catch { return false; }
+}
 
 function startWatchPolling() {
   async function poll() {
+    // Orphan guard: if the parent Claude session died we get re-parented to
+    // PID 1 — exit instead of polling forever (2026-07-02: 28 zombies found).
+    if (process.ppid === 1) {
+      logDebug('Parent process gone (ppid=1), exiting to avoid zombie polling.');
+      process.exit(0);
+    }
+
     pollCount++;
     lastPollTime = new Date().toISOString();
     lastPollError = null;
@@ -295,6 +318,15 @@ function startWatchPolling() {
     const myWatches = watches.filter(w => w.tty === windowTty);
     if (!myWatches.length) return;
 
+    // Never generate network/auth traffic without a live master: each doomed
+    // reconnect is a failed auth that feeds the bastion's fail2ban.
+    if (!masterAlive(SSH_HOST)) {
+      consecutivePollFailures++;
+      lastPollError = `SSH master to ${SSH_HOST} is dead — polling paused (backoff ${Math.round(currentPollDelay() / 1000)}s). Reconnect interactively: run \`ssh ${SSH_HOST}\` in a terminal (needs Duo).`;
+      logDebug(lastPollError);
+      return;
+    }
+
     const completedIds = new Set();
     let stateChanged = false;
 
@@ -303,7 +335,7 @@ function startWatchPolling() {
     let stateMap = new Map();
     try {
       const escaped = `sacct -j ${jobIds} --format=JobID%-20,State -P -n`.replace(/'/g, "'\"'\"'");
-      const { stdout } = await execFileAsync('ssh', [SSH_HOST, `bash --login -c '${escaped}'`], {
+      const { stdout } = await execFileAsync('ssh', ['-o', 'BatchMode=yes', SSH_HOST, `bash --login -c '${escaped}'`], {
         timeout: 15000, encoding: 'utf8',
       });
       for (const line of stdout.split('\n')) {
@@ -315,10 +347,12 @@ function startWatchPolling() {
         if (!stateMap.has(baseId)) stateMap.set(baseId, state);
       }
     } catch (err) {
-      lastPollError = `batch sacct: ${String(err?.message ?? err)}`;
+      consecutivePollFailures++;
+      lastPollError = `batch sacct: ${String(err?.message ?? err)} (backoff ${Math.round(currentPollDelay() / 1000)}s)`;
       logDebug(`Batch poll failed: ${String(err?.message ?? err)}`);
       return; // Skip this cycle on failure
     }
+    consecutivePollFailures = 0;
 
     for (const w of myWatches) {
       const state = stateMap.get(w.jobId) || 'UNKNOWN';
@@ -344,9 +378,10 @@ function startWatchPolling() {
       saveWatches(updated);
     }
   }
-  // setTimeout chain: wait for poll to finish before scheduling next
+  // setTimeout chain: wait for poll to finish before scheduling next.
+  // Delay is dynamic: exponential backoff under sustained failure.
   (function scheduleNext() {
-    setTimeout(async () => { await poll(); scheduleNext(); }, POLL_INTERVAL);
+    setTimeout(async () => { await poll(); scheduleNext(); }, currentPollDelay());
   })();
 }
 
@@ -389,26 +424,30 @@ function sshExec(cmd, timeout = TIMEOUT) {
     timeout, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 5 * 1024 * 1024,
   }).trim();
 
+  // Fail fast with zero network traffic when the master is dead: chained MFA
+  // (publickey+Duo) means a non-interactive reconnect can never succeed — it
+  // only records a failed auth on the bastion and feeds fail2ban. The old
+  // auto-reconnect here (`ssh -O exit` + `ssh -fN`) killed the shared master
+  // (the only Duo-free session token) and retried blindly; combined with
+  // zombie pollers it caused the 2026 connection-storm bans. Never restore it.
+  if (!masterAlive(SSH_HOST)) {
+    throw new Error(
+      `SSH master connection to ${SSH_HOST} is dead. Background processes cannot ` +
+      `re-authenticate (Duo required). Fix: run \`ssh ${SSH_HOST}\` interactively ` +
+      `in a terminal once, then retry this tool.`
+    );
+  }
+
   try {
     return doExec();
   } catch (e) {
     const stderr = e.stderr ? String(e.stderr).trim() : '';
-    // Auto-reconnect on connection failure
     if (stderr.includes('Connection closed') || stderr.includes('Connection reset') ||
         stderr.includes('Connection refused') || stderr.includes('not a socket') ||
         e.message?.includes('socket is not connected')) {
-      logDebug(`SSH connection lost, attempting reconnect to ${SSH_HOST}...`);
-      try {
-        // Kill stale ControlMaster and establish new connection
-        try { execSync(`ssh -O exit ${SSH_HOST} 2>/dev/null`, { timeout: 3000, stdio: 'ignore' }); } catch {}
-        execSync(`ssh -fN ${SSH_HOST}`, { timeout: 15000, stdio: 'ignore' });
-        logDebug('SSH reconnected, retrying command...');
-        return doExec();
-      } catch (reconErr) {
-        e.message = `SSH reconnect failed: ${String(reconErr?.message ?? reconErr)}\nOriginal: ${e.message}`;
-        if (stderr) e.message += `\nSTDERR: ${stderr}`;
-        throw e;
-      }
+      e.message = `SSH connection to ${SSH_HOST} failed mid-command (master may have just died, ` +
+        `or the bastion is fail2ban-banned). Do NOT retry in a loop — check \`ssh -O check ${SSH_HOST}\`, ` +
+        `reconnect interactively if needed.\nOriginal: ${e.message}`;
     }
     if (stderr) e.message = `${e.message}\nSTDERR: ${stderr}`;
     throw e;
@@ -867,8 +906,11 @@ server.tool('slurm_submit', 'Submit a SLURM batch job (auto-checks resource hist
       const estSeconds = parseTimeToSeconds(args.time);
       registerWatch(jobId, args.job_name, estSeconds, args.partition);
       const estMin = Math.round(estSeconds / 60);
-      const pollCmd = `while true; do state=$(ssh ${SSH_HOST} "bash --login -c 'sacct -j ${jobId} --format=State --noheader -P'" 2>/dev/null | head -1 | tr -d ' '); if [[ "\\$state" == "COMPLETED" || "\\$state" == "FAILED" || "\\$state" == "CANCELLED" || "\\$state" == "TIMEOUT" ]]; then echo "✅ SLURM job ${jobId} (${args.job_name}): \\$state"; break; fi; sleep 10; done`;
-      return { content: [{ type: 'text', text: out + `\n👁️ Watch registered: job ${jobId}, est. ${estMin}min` + resourceInfo + workdirHint + `\n⏳ POLL_CMD: ${pollCmd}` }] };
+      // No POLL_CMD suggestion: the built-in 30s batched watcher already
+      // monitors this job and piggybacks a notification onto the next tool
+      // result. Handing the client a 10s `while true; do ssh ...` loop
+      // multiplies SSH traffic for nothing (connection-storm lesson, 2026-07-02).
+      return { content: [{ type: 'text', text: out + `\n👁️ Watch registered: job ${jobId}, est. ${estMin}min — completion auto-notifies on the next tool call (or check slurm_watches). Do NOT poll with ssh loops.` + resourceInfo + workdirHint }] };
     }
     return { content: [{ type: 'text', text: out + resourceInfo + workdirHint }] };
   } catch (e) {
@@ -895,10 +937,25 @@ server.tool('slurm_logs', 'Read SLURM job output log', {
 }, async (args) => {
   try {
     const jid = validateJobId(args.job_id);
-    // Find the log file via sacct
-    const stdoutPath = sshExec(`sacct -j ${jid} --format=StdOut%-200 -P -n | head -1`, 10000).trim();
+    // Find the log file. sacct StdOut is empty on clusters whose accounting
+    // doesn't store it (e.g. SMU SuperPOD, verified 2026-07-02) — fall back
+    // to scontrol (recent/running jobs), then to the stored workdir's log dirs.
+    let stdoutPath = sshExec(`sacct -j ${jid} --format=StdOut%-200 -P -n | head -1`, 10000).trim();
     if (!stdoutPath || stdoutPath === '|') {
-      return { content: [{ type: 'text', text: `No log file found for job ${jid}. Job may still be pending.` }] };
+      try {
+        stdoutPath = sshExec(`scontrol show job ${jid} 2>/dev/null | grep -o 'StdOut=[^ ]*' | cut -d= -f2`, 10000).trim();
+      } catch { stdoutPath = ''; }
+    }
+    if (!stdoutPath) {
+      const wd = loadWorkdir();
+      if (wd) {
+        try {
+          stdoutPath = sshExec(`ls ${wd}/results/logs/slurm_${jid}.out ${wd}/logs/slurm_${jid}.out ${wd}/slurm_${jid}.out ${wd}/slurm-${jid}.out 2>/dev/null | head -1`, 10000).trim();
+        } catch { stdoutPath = ''; }
+      }
+    }
+    if (!stdoutPath || stdoutPath === '|') {
+      return { content: [{ type: 'text', text: `No log file found for job ${jid}. Notes: this cluster's sacct does not store StdOut and scontrol only knows recent jobs — pass the --output path you used, and avoid /tmp for --output (it is node-local on compute nodes, the file never reaches the login node).` }] };
     }
     if (UNSAFE_PATH.test(stdoutPath)) {
       return { content: [{ type: 'text', text: `Suspicious log path from sacct: ${stdoutPath}` }], isError: true };
@@ -1076,6 +1133,11 @@ server.tool('sync_files', 'Sync files between local and HPC via rsync', {
   if (remoteErr) return { content: [{ type: 'text', text: remoteErr }], isError: true };
   if (!args.local_path.startsWith('/') && !args.local_path.startsWith('~')) {
     return { content: [{ type: 'text', text: 'local_path must be an absolute path' }], isError: true };
+  }
+  // Same guard as sshExec: rsync spawns ssh underneath — with a dead master
+  // it would burn a doomed (Duo-required) auth attempt against the bastion.
+  if (!masterAlive(SSH_HOST)) {
+    return { content: [{ type: 'text', text: `SSH master connection to ${SSH_HOST} is dead. Run \`ssh ${SSH_HOST}\` interactively in a terminal once (needs Duo), then retry.` }], isError: true };
   }
   const rsyncArgs = ['-avz', '--partial'];
   if (args.delete) rsyncArgs.push('--delete');
@@ -1293,6 +1355,13 @@ server.tool('slurm_watches', 'List active SLURM job watches and pending notifica
 
 // Start watch polling loop
 startWatchPolling();
+
+// Lifecycle: a stdio MCP server must die with its client. Without these, the
+// setTimeout polling chain keeps the event loop alive forever after the
+// Claude session exits (2026-07-02: 28 zombie servers from 3 weeks found).
+process.stdin.on('end', () => { logDebug('stdin closed, exiting.'); process.exit(0); });
+process.stdin.on('close', () => { logDebug('stdin closed, exiting.'); process.exit(0); });
+process.stdin.on('error', () => process.exit(0));
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

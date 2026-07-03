@@ -6,6 +6,9 @@ A zero-dependency MCP server for SLURM HPC clusters. Single file, `npx`-ready.
 
 - **Single file, zero config** — `npx slurm-mcp-server` and you're done
 - **TTY-aware job watching** — each terminal window tracks its own jobs, no cross-talk
+- **Orphan watch adoption** — jobs outliving their session are adopted by any live instance; completion notifications survive session restarts
+- **MFA/fail2ban-safe** — never attempts non-interactive re-auth; dead SSH master ⇒ fail fast with clear guidance, polling backs off exponentially
+- **Clean lifecycle** — server exits with its client (no zombie pollers), heartbeat files let peers detect dead sessions
 - **Command Guard** — blocks 7 categories of SSH escape traps that silently corrupt commands
 - **Desktop notifications** — native alerts on macOS and Linux when jobs finish
 - **Resource waste prevention** — checks historical usage before submitting, warns on over-allocation
@@ -106,7 +109,10 @@ That's it. SSH ControlMaster is recommended for persistent connections.
 ## Features
 
 ### 🖥️ TTY-Aware Job Watching
-Each terminal window tracks its own SLURM jobs independently. No cross-talk between windows. Automatic 30-second polling with state change detection.
+Each terminal window tracks its own SLURM jobs independently. No cross-talk between windows. Automatic 30-second polling (one batched `sacct` per cluster) with state change detection. Watch TTL follows the job's own time limit, so multi-day jobs are never silently dropped.
+
+### 👪 Orphan Watch Adoption
+Every poller writes a heartbeat; when a session dies, its watches are adopted by any live instance and keep being monitored. Pending notifications from closed sessions are surfaced (and drained) by whichever session runs next — long jobs never complete silently.
 
 ### 🛡️ Command Guard
 Prevents 7 categories of SSH escape traps that silently corrupt commands:
@@ -126,10 +132,10 @@ Before submitting jobs, automatically queries `sacct` for historical resource us
 Per-window working directory tracking prevents accidentally submitting jobs to wrong directories.
 
 ### 🌐 Multi-Cluster Support
-Configure multiple clusters with comma-separated `HPC_HOST`. Switch between them with `cluster_switch`.
+Configure multiple clusters with comma-separated `HPC_HOST`. Switch between them with `cluster_switch`. Each watch remembers its cluster, so jobs on multiple clusters are polled correctly at the same time. `HPC_PREAMBLE` is only injected on the primary cluster (module names differ across clusters); pass `preamble: false` on `slurm_submit` to skip it entirely.
 
-### 🔄 SSH Auto-Reconnect
-Detects dropped SSH connections and automatically re-establishes ControlMaster before retrying the command.
+### 🚦 MFA-Safe Connection Handling
+On clusters enforcing chained MFA (publickey **and** Duo), a background process can never re-authenticate — each blind reconnect attempt is just a failed login that feeds the bastion's fail2ban. This server therefore never kills or rebuilds your SSH ControlMaster. It probes the master socket locally (`ssh -O check`, zero network) before any traffic; if the master is dead it fails fast with instructions to reconnect interactively, and polling pauses with exponential backoff (30s → 10min).
 
 ### 📋 Job Templates
 Save and reuse common SLURM configurations (partition, GPU count, memory, time). Apply with `template: "my-template"` on submit.
@@ -159,7 +165,7 @@ Start a tmux-based interactive SSH session for commands needing 2FA, confirmatio
 | | `slurm_submit` | Submit batch job (supports arrays + templates) |
 | | `slurm_submit_file` | Submit existing .slurm/.sh script |
 | | `slurm_cancel` | Cancel job |
-| | `slurm_logs` | Read job output log |
+| | `slurm_logs` | Read job output log (sacct → scontrol → workdir fallback) |
 | | `slurm_watches` | List active job watches |
 | | `resource_check` | Check historical resource usage |
 | | `resource_report` | Summarize usage over time period |

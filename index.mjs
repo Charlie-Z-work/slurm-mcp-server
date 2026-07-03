@@ -7,7 +7,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { execSync, execFileSync, execFile as execFileCb } from 'child_process';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { promisify } from 'util';
@@ -97,11 +97,38 @@ function loadWatches() {
   try {
     const data = JSON.parse(readFileSync(WATCHES_FILE, 'utf-8'));
     const now = Date.now();
-    return data.filter(w => now - new Date(w.submittedAt).getTime() < 48 * 3600 * 1000);
+    // TTL honors the job's own time limit: a flat 48h silently dropped watches
+    // for jobs at the 2-day partition limit that queued before starting.
+    return data.filter(w => {
+      const ttlMs = Math.max(48 * 3600, (w.estimatedSeconds || 0) + 24 * 3600) * 1000;
+      return now - new Date(w.submittedAt).getTime() < ttlMs;
+    });
   } catch (err) {
     if (err.code !== 'ENOENT') logDebug(`loadWatches failed: ${err.message}`);
     return [];
   }
+}
+
+// --- Poller heartbeat: lets other servers detect dead sessions and adopt
+// their orphaned watches (a watch is only ever polled by its owning tty's
+// server — without adoption, jobs outliving their session never notify). ---
+const HEARTBEAT_DIR = join(homedir(), '.claude', 'hpc-pollers');
+
+function writeHeartbeat() {
+  try {
+    mkdirSync(HEARTBEAT_DIR, { recursive: true });
+    writeFileSync(join(HEARTBEAT_DIR, `${windowTty}.json`),
+      JSON.stringify({ pid: process.pid, at: Date.now() }));
+  } catch (err) { logDebug(`writeHeartbeat failed: ${err.message}`); }
+}
+
+function pollerAlive(tty) {
+  try {
+    const hb = JSON.parse(readFileSync(join(HEARTBEAT_DIR, `${tty}.json`), 'utf-8'));
+    if (Date.now() - hb.at > 150_000) return false; // 5 poll cycles stale
+    process.kill(hb.pid, 0); // throws if pid is gone
+    return true;
+  } catch { return false; }
 }
 
 function saveWatches(watches) {
@@ -114,6 +141,7 @@ function registerWatch(jobId, jobName, estimatedSeconds, partition) {
   watches.push({
     jobId,
     tty: windowTty,
+    host: SSH_HOST, // cluster this job belongs to (multi-cluster polling)
     jobName,
     submittedAt: new Date().toISOString(),
     estimatedSeconds,
@@ -250,12 +278,14 @@ function markCompleted(watch, state) {
 
 function drainNotifications() {
   const allNotifs = loadNotifications();
-  const mine = allNotifs.filter(n => n.tty === windowTty);
+  // Drain own notifications, plus orphans whose owning session is dead —
+  // otherwise a notification for a closed session stays invisible forever.
+  const claimable = (n) => n.tty === windowTty || !pollerAlive(n.tty);
+  const mine = allNotifs.filter(claimable);
   if (!mine.length) return '';
-  // Atomic: remove only this tty's notifications, keep others
-  const remaining = allNotifs.filter(n => n.tty !== windowTty);
+  const remaining = allNotifs.filter(n => !claimable(n));
   saveNotifications(remaining);
-  const msgs = mine.map(n => n.message).join('\n');
+  const msgs = mine.map(n => n.tty === windowTty ? n.message : `${n.message} (from closed session ${n.tty})`).join('\n');
   return `\n--- SLURM Notifications ---\n${msgs}\n---\n\n`;
 }
 
@@ -314,48 +344,74 @@ function startWatchPolling() {
       return;
     }
 
+    // Announce liveness before any early return — adoption below relies on it.
+    writeHeartbeat();
+
+    // Adopt orphaned watches: their owning session is gone, so nobody polls
+    // them and their jobs would complete silently. Rewriting tty hands them
+    // to this poller (from next cycle). 90s grace avoids racing a server that
+    // registered a watch before its first heartbeat.
+    let adopted = false;
+    for (const w of watches) {
+      if (w.tty !== windowTty && !pollerAlive(w.tty) &&
+          Date.now() - new Date(w.submittedAt).getTime() > 90_000) {
+        logDebug(`Adopting orphan watch ${w.jobId} (${w.jobName}) from dead session ${w.tty}`);
+        w.tty = windowTty;
+        adopted = true;
+      }
+    }
+    if (adopted) saveWatches(watches);
+
     // Only poll watches belonging to this window's tty
     const myWatches = watches.filter(w => w.tty === windowTty);
     if (!myWatches.length) return;
 
-    // Never generate network/auth traffic without a live master: each doomed
-    // reconnect is a failed auth that feeds the bastion's fail2ban.
-    if (!masterAlive(SSH_HOST)) {
-      consecutivePollFailures++;
-      lastPollError = `SSH master to ${SSH_HOST} is dead — polling paused (backoff ${Math.round(currentPollDelay() / 1000)}s). Reconnect interactively: run \`ssh ${SSH_HOST}\` in a terminal (needs Duo).`;
-      logDebug(lastPollError);
-      return;
-    }
-
     const completedIds = new Set();
     let stateChanged = false;
 
-    // Batch query: single sacct call for all watched jobs
-    const jobIds = myWatches.map(w => w.jobId).join(',');
-    let stateMap = new Map();
-    try {
-      const escaped = `sacct -j ${jobIds} --format=JobID%-20,State -P -n`.replace(/'/g, "'\"'\"'");
-      const { stdout } = await execFileAsync('ssh', ['-o', 'BatchMode=yes', SSH_HOST, `bash --login -c '${escaped}'`], {
-        timeout: 15000, encoding: 'utf8',
-      });
-      for (const line of stdout.split('\n')) {
-        const [rawId, state] = line.split('|').map(s => s?.trim());
-        if (!rawId || !state) continue;
-        // sacct may return sub-job lines like "12345.batch" — use base job ID
-        const baseId = rawId.split('.')[0];
-        // Keep the first (main) state for each job
-        if (!stateMap.has(baseId)) stateMap.set(baseId, state);
-      }
-    } catch (err) {
-      consecutivePollFailures++;
-      lastPollError = `batch sacct: ${String(err?.message ?? err)} (backoff ${Math.round(currentPollDelay() / 1000)}s)`;
-      logDebug(`Batch poll failed: ${String(err?.message ?? err)}`);
-      return; // Skip this cycle on failure
+    // Group by cluster; one batched sacct per host. Never generate network
+    // traffic toward a host without a live master: each doomed reconnect is
+    // a failed auth that feeds the bastion's fail2ban.
+    const byHost = new Map();
+    for (const w of myWatches) {
+      const h = w.host || SSH_HOST;
+      if (!byHost.has(h)) byHost.set(h, []);
+      byHost.get(h).push(w);
     }
-    consecutivePollFailures = 0;
+
+    const stateMap = new Map(); // key: `${host}|${baseJobId}`
+    let anyHostFailed = false;
+    for (const [host, hostWatches] of byHost) {
+      if (!masterAlive(host)) {
+        anyHostFailed = true;
+        lastPollError = `SSH master to ${host} is dead — its watches paused (backoff ${Math.round(currentPollDelay() / 1000)}s). Reconnect interactively: run \`ssh ${host}\` in a terminal (needs Duo).`;
+        logDebug(lastPollError);
+        continue;
+      }
+      const jobIds = hostWatches.map(w => w.jobId).join(',');
+      try {
+        const escaped = `sacct -j ${jobIds} --format=JobID%-20,State -P -n`.replace(/'/g, "'\"'\"'");
+        const { stdout } = await execFileAsync('ssh', ['-o', 'BatchMode=yes', host, `bash --login -c '${escaped}'`], {
+          timeout: 15000, encoding: 'utf8',
+        });
+        for (const line of stdout.split('\n')) {
+          const [rawId, state] = line.split('|').map(s => s?.trim());
+          if (!rawId || !state) continue;
+          // sacct may return sub-job lines like "12345.batch" — use base job ID
+          const baseId = rawId.split('.')[0];
+          // Keep the first (main) state for each job
+          if (!stateMap.has(`${host}|${baseId}`)) stateMap.set(`${host}|${baseId}`, state);
+        }
+      } catch (err) {
+        anyHostFailed = true;
+        lastPollError = `batch sacct (${host}): ${String(err?.message ?? err)} (backoff ${Math.round(currentPollDelay() / 1000)}s)`;
+        logDebug(`Batch poll failed for ${host}: ${String(err?.message ?? err)}`);
+      }
+    }
+    if (anyHostFailed) consecutivePollFailures++; else consecutivePollFailures = 0;
 
     for (const w of myWatches) {
-      const state = stateMap.get(w.jobId) || 'UNKNOWN';
+      const state = stateMap.get(`${w.host || SSH_HOST}|${w.jobId}`) || 'UNKNOWN';
       if (TERMINAL_STATES.has(state)) {
         markCompleted(w, state);
         completedIds.add(w.jobId);
@@ -823,6 +879,7 @@ server.tool('slurm_submit', 'Submit a SLURM batch job (auto-checks resource hist
   output_dir: z.string().optional().describe('Log output dir (default: results/logs)'),
   array: z.string().optional().describe('SLURM array spec (e.g. "1-10", "1-100%5")'),
   template: z.string().optional().describe('Name of saved template to use as defaults'),
+  preamble: z.boolean().optional().default(true).describe('Include HPC_PREAMBLE (module loads/conda env) in the job script. Set false for generic jobs that do not need the project environment.'),
 }, async (rawArgs) => {
   // Defaults — template values override these, user explicit values override template
   const DEFAULTS = { job_name: 'slurm-job', partition: 'batch', gpus: 1, mem: '4G', time: '00:15:00', output_dir: 'results/logs' };
@@ -889,7 +946,9 @@ server.tool('slurm_submit', 'Submit a SLURM batch job (auto-checks resource hist
   if (args.gpus != null && args.gpus > 0) lines.push(`#SBATCH --gres=gpu:${args.gpus}`);
   if (args.cpus_per_task) lines.push(`#SBATCH --cpus-per-task=${args.cpus_per_task}`);
   if (args.array) lines.push(`#SBATCH --array=${args.array}`);
-  if (HPC_PREAMBLE) {
+  // Preamble is cluster-specific (module names differ across clusters):
+  // only inject on the primary cluster, and honor preamble:false opt-out.
+  if (HPC_PREAMBLE && args.preamble !== false && SSH_HOST === HPC_HOSTS[0]) {
     lines.push('', ...HPC_PREAMBLE.split('\n'));
   }
   if (cdLine) lines.push(cdLine);
@@ -1337,12 +1396,13 @@ server.tool('slurm_watches', 'List active SLURM job watches and pending notifica
     }
     parts.push(`Last poll error: ${lastPollError || '(none)'}`);
 
-    // Notifications from disk (not memory — eliminates drain race)
+    // Notifications from disk (not memory — eliminates drain race).
+    // Show ALL ttys' pending notifications: a job submitted from a closed
+    // session must still be discoverable here.
     const allNotifs = loadNotifications();
-    const myNotifs = allNotifs.filter(n => n.tty === windowTty);
-    if (myNotifs.length) {
-      parts.push(`\nPending notifications (${myNotifs.length}):`);
-      parts.push(myNotifs.map(n => `  ${n.message}`).join('\n'));
+    if (allNotifs.length) {
+      parts.push(`\nPending notifications (${allNotifs.length}):`);
+      parts.push(allNotifs.map(n => `  ${n.message}${n.tty === windowTty ? '' : ` [session ${n.tty}]`}`).join('\n'));
     } else {
       parts.push('\nNo pending notifications.');
     }
@@ -1359,9 +1419,14 @@ startWatchPolling();
 // Lifecycle: a stdio MCP server must die with its client. Without these, the
 // setTimeout polling chain keeps the event loop alive forever after the
 // Claude session exits (2026-07-02: 28 zombie servers from 3 weeks found).
-process.stdin.on('end', () => { logDebug('stdin closed, exiting.'); process.exit(0); });
-process.stdin.on('close', () => { logDebug('stdin closed, exiting.'); process.exit(0); });
-process.stdin.on('error', () => process.exit(0));
+function shutdown() {
+  // Remove our heartbeat so other pollers can adopt our watches immediately.
+  try { unlinkSync(join(HEARTBEAT_DIR, `${windowTty}.json`)); } catch {}
+  process.exit(0);
+}
+process.stdin.on('end', () => { logDebug('stdin closed, exiting.'); shutdown(); });
+process.stdin.on('close', () => { logDebug('stdin closed, exiting.'); shutdown(); });
+process.stdin.on('error', () => shutdown());
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

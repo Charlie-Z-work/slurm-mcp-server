@@ -53,7 +53,19 @@ Partition availability varies by cluster. Common patterns:
 | short/debug | Quick tests | Often limited to 1-2 concurrent jobs |
 | gpu | GPU jobs | May require `--gres=gpu:N` |
 
-Set your default partition via `HPC_PREAMBLE` or per-job with the `partition` parameter.
+Choose the partition per job with the `partition` parameter of `slurm_submit` (default `batch`), or put it in a saved template. `HPC_PREAMBLE` only injects shell lines into the job body — it cannot change the partition.
+
+**How to check per-user caps:** run `cluster_info` — its `Per-user limits` section lists `MaxTime`, `MaxJobsPU` (max running jobs per user) and `MaxTRESPU` (per-user cpu/gpu/mem cap) for every partition. `slurm_submit` also prints a ⚠️ hint when a request hits one of these caps.
+
+**Array tasks on a 1-job partition serialize:** with `MaxJobsPU=1`, an array of N tasks runs one task at a time (N × runtime), and a request above `MaxTRESPU` is rejected under `DenyOnLimit`. For parallel chunks, submit the array to a partition without a per-user cap (e.g. `batch`).
+
+## Array Jobs
+
+- `slurm_submit` with `array: "1-20"` (or `"1-100%10"` to cap concurrency); each task reads `$SLURM_ARRAY_TASK_ID`.
+- Logs: `slurm_<jobid>_<task>.out`. Read one with `slurm_logs("12345_3")`.
+- The watch reports once, when all tasks are done: `N ok / M failed`.
+- Cancel one task with `slurm_cancel("12345_3")`, a range with `"12345_[1-5]"`, or everything with `"12345"`.
+- Chain a follow-up step with `dependency: "afterok:12345"`.
 
 ## Environment Setup (HPC_PREAMBLE)
 

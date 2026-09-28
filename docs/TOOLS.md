@@ -56,6 +56,17 @@ Write content to a file on HPC.
 
 ---
 
+### ssh_interactive
+Start an interactive SSH session to HPC inside a local tmux session (for 2FA, confirmation prompts, long monitoring). Use `terminal_read` / `terminal_send` to interact.
+
+**Parameters:**
+| Name | Type | Required | Default | Description |
+|------|------|:---:|---------|-------------|
+| command | string | ❌ | — | Command to run after connecting |
+| session | string | ❌ | hpc-interactive | tmux session name |
+
+---
+
 ## SLURM Tools
 
 ### slurm_status
@@ -64,7 +75,7 @@ Check SLURM job status.
 **Parameters:**
 | Name | Type | Required | Default | Description |
 |------|------|:---:|---------|-------------|
-| job_id | string | ❌ | — | Specific job ID (omit for all your jobs) |
+| job_id | string | ❌ | — | `12345`, array task `12345_3`, or task range `12345_[1-5]` (omit for all your jobs) |
 
 ---
 
@@ -74,20 +85,36 @@ Submit a SLURM batch job with automatic resource checking.
 **Parameters:**
 | Name | Type | Required | Default | Description |
 |------|------|:---:|---------|-------------|
-| script | string | ✅ | — | Main command to run |
-| job_name | string | ❌ | nanoclaw-job | Job name |
-| partition | string | ❌ | batch | SLURM partition |
-| gpus | number | ❌ | 1 | Number of GPUs |
-| mem | string | ❌ | 4G | Memory allocation |
-| time | string | ❌ | 00:15:00 | Time limit (HH:MM:SS) |
-| cpus_per_task | number | ❌ | — | CPUs per task |
-| output_dir | string | ❌ | results/logs | Log output directory |
+| script | string | ✅ | — | Main command(s) to run |
+| job_name | string | ❌ | slurm-job | Job name, `[A-Za-z0-9_.-]{1,64}` |
+| partition | string | ❌ | batch | SLURM partition (`[A-Za-z0-9_-]+`). See `cluster_info` for per-user caps |
+| gpus | number | ❌ | 1 | Number of GPUs (non-negative integer; some sites reject 0) |
+| mem | string | ❌ | 4G | Memory, `^\d+[KMGT]?$` |
+| time | string | ❌ | 00:15:00 | Time limit: `M`, `M:S`, `H:M:S`, `D-H`, `D-H:M`, `D-H:M:S` |
+| cpus_per_task | number | ❌ | — | CPUs per task (non-negative integer) |
+| output_dir | string | ❌ | results/logs | Log output directory (under the workdir if relative and a workdir is set) |
+| array | string | ❌ | — | Array spec: `1-10`, `1,3,5-7`, `1-100%5` (`%N` = max concurrent tasks) |
+| dependency | string | ❌ | — | e.g. `afterok:12345`, `afterany:12345_2`, `singleton` (comma-separated list allowed) |
+| template | string | ❌ | — | Saved template to use as defaults (unknown name → error) |
+| preamble | boolean | ❌ | true | Inject `HPC_PREAMBLE` (primary cluster only). A template's string `preamble` is injected regardless, after `HPC_PREAMBLE` and before `cd` |
 
 **Features:**
+- Every parameter is validated against a whitelist; invalid input returns an error instead of a broken script
 - Auto-checks resource history before submitting
 - Workdir guard prevents wrong-directory submissions
-- Registers job for automatic watch polling
-- Returns POLL_CMD for background monitoring
+- Logs go to `slurm_%j.out`, or `slurm_%A_%a.out` for arrays
+- Registers the job for automatic watch polling — the completion notification (with an `N ok / M failed` tally for arrays) is prepended to your next tool result. Do not poll with ssh loops.
+- Non-blocking ⚠️ hints when the partition's per-user cap will serialize array tasks / extra jobs, or when gpus/mem/time exceed the cap (DenyOnLimit would reject)
+
+---
+
+### slurm_submit_file
+Submit an existing `.slurm`/`.sh` script already on the cluster, and register a watch for it.
+
+**Parameters:**
+| Name | Type | Required | Default | Description |
+|------|------|:---:|---------|-------------|
+| path | string | ✅ | — | Absolute path to the script on HPC |
 
 ---
 
@@ -97,7 +124,20 @@ Cancel a SLURM job.
 **Parameters:**
 | Name | Type | Required | Default | Description |
 |------|------|:---:|---------|-------------|
-| job_id | string | ✅ | — | Job ID to cancel |
+| job_id | string | ✅ | — | `12345` (whole job/array), `12345_3` (one task) or `12345_[1-5]` (task range) |
+
+Only a whole-job cancel removes the watch; cancelling some array tasks keeps watching the rest.
+
+---
+
+### slurm_logs
+Read a job's output log (sacct `StdOut` → `scontrol` → workdir log dirs fallback).
+
+**Parameters:**
+| Name | Type | Required | Default | Description |
+|------|------|:---:|---------|-------------|
+| job_id | string | ✅ | — | Job ID; for arrays pass one task, e.g. `12345_3` |
+| lines | number | ❌ | 50 | Lines to read from the end (0 = all) |
 
 ---
 
@@ -122,10 +162,31 @@ Returns: sacct history, peak memory/time, recommended resource allocations.
 
 ---
 
+### resource_report
+Summarize your usage over a period: job counts, compute hours, GPU jobs, peak memory.
+
+**Parameters:**
+| Name | Type | Required | Default | Description |
+|------|------|:---:|---------|-------------|
+| days | number | ❌ | 7 | Days to look back |
+| format | enum | ❌ | text | `text` or `csv` |
+
+---
+
 ### cluster_info
-Get HPC cluster partitions and job status.
+Get cluster partitions (`sinfo -s`), your jobs, a queue estimate, and a `Per-user limits` section (MaxTime / MaxJobsPU / MaxTRESPU per partition, from `scontrol show partition` + `sacctmgr show qos`).
 
 **Parameters:** None
+
+---
+
+### cluster_switch
+Switch the active cluster (multi-cluster `HPC_HOST`). Omit `host` to list clusters. Existing watches keep polling their own cluster.
+
+**Parameters:**
+| Name | Type | Required | Default | Description |
+|------|------|:---:|---------|-------------|
+| host | string | ❌ | — | Cluster host to switch to |
 
 ---
 
@@ -158,6 +219,31 @@ Set HPC working directory for this terminal window.
 
 ### workdir_get
 Get HPC working directory for this terminal window.
+
+**Parameters:** None
+
+---
+
+## Template Tools
+
+### template_save
+Save a reusable job template (stored in `~/.claude/slurm-templates.json`).
+
+**Parameters:**
+| Name | Type | Required | Default | Description |
+|------|------|:---:|---------|-------------|
+| name | string | ✅ | — | Template name |
+| partition | string | ❌ | — | Partition |
+| gpus | number | ❌ | — | GPUs |
+| mem | string | ❌ | — | Memory |
+| time | string | ❌ | — | Time limit |
+| cpus_per_task | number | ❌ | — | CPUs per task |
+| preamble | string | ❌ | — | Extra shell lines injected after `HPC_PREAMBLE` and before `cd` |
+
+---
+
+### template_list
+List saved templates.
 
 **Parameters:** None
 
@@ -222,6 +308,6 @@ Kill a tmux session.
 ## Reference
 
 ### guide
-Read the built-in HPC usage guide.
+Read the built-in HPC usage guide, plus the file at `HPC_GUIDE_EXTRA` (appended under "Site-specific guide") when set, plus current watch status.
 
 **Parameters:** None

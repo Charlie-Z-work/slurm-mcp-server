@@ -11,7 +11,7 @@
  * terminal first; this script never authenticates by itself).
  *
  * Env:
- *   HPC_HOST, HPC_USER, SLURM_ACCOUNT   required (same as the server)
+ *   HPC_HOST, HPC_USER    required (same as the server; SLURM_ACCOUNT optional)
  *   LIVE_SMOKE_DIR        required, absolute remote dir, created and DELETED
  *   LIVE_SMOKE_PARTITION  partition for the array job (default: short)
  *   HPC_GUIDE_EXTRA       optional; if set, `guide` must include it
@@ -29,7 +29,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-for (const k of ['HPC_HOST', 'HPC_USER', 'SLURM_ACCOUNT', 'LIVE_SMOKE_DIR']) {
+for (const k of ['HPC_HOST', 'HPC_USER', 'LIVE_SMOKE_DIR']) {
   if (!process.env[k]) { console.error(`live-smoke: missing env ${k}`); process.exit(2); }
 }
 const DIR = process.env.LIVE_SMOKE_DIR.replace(/\/+$/, '');

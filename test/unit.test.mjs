@@ -5,10 +5,10 @@
 // (see CHANGELOG, Unreleased → Fixed).
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, mkdirSync, utimesSync, statSync, rmdirSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, mkdirSync, utimesSync, rmSync } from 'node:fs';
+import { tmpdir, hostname } from 'node:os';
 import { join, dirname } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -19,6 +19,8 @@ Object.assign(process.env, {
 delete process.env.NOTIFY_WEBHOOK;
 delete process.env.HPC_RESOURCE_LOG;
 const M = await import(pathToFileURL(join(ROOT, 'index.mjs')).href);
+// A pid that existed and has exited (for "dead lock owner" tests).
+const DEAD_PID = spawnSync(process.execPath, ['-e', '']).pid;
 
 // Mirrors the poller's aggregation: sacct rows → Map(taskKey → state), the
 // allocation row (listed before its .batch/.extern steps) wins per task.
@@ -328,12 +330,15 @@ describe('checkResourceWaste', () => {
 
 describe('parseMemToMB / summarizeResourceReport (B8)', () => {
   const cases = [['1201368K', 1201368 / 1024], ['1.5M', 1.5], ['2.25G', 2304], ['2T', 2 * 1024 * 1024], ['1P', 1024 ** 3],
-    ['1048576', 1], ['0', 0], ['4Gn', 4096], ['500Mc', 500], ['4GB', 4096], ['4GiB', 4096]];
+    ['1048576', 1024], ['0', 0], ['4Gn', 4096], ['500Mc', 500], ['4GB', 4096], ['4GiB', 4096]];
   for (const [s, v] of cases) test(`parseMemToMB(${s}) = ${v}`, () => assert.ok(Math.abs(M.parseMemToMB(s) - v) < 1e-9, String(M.parseMemToMB(s))));
   for (const bad of ['', null, undefined, 'x', '1.2.3G', '-1K', '4X']) test(`parseMemToMB(${JSON.stringify(bad)}) = null`, () => assert.equal(M.parseMemToMB(bad), null));
-  test('bare number is bytes for sacct, MB for requests', () => {
-    assert.equal(M.parseMemToMB('2048'), 2048 / 1024 / 1024);
+  test('bare number is KB for sacct (R11), MB for requests', () => {
+    assert.equal(M.parseMemToMB('2048'), 2);
     assert.equal(M.parseMemToMB('2048', 'M'), 2048);
+    // resource history: a suffix-less MaxRSS is not under-read 1024x
+    const h = M.parseResourceHistory('9|t|00:01:00||4G|COMPLETED\n9.batch|batch|00:01:00|3145728||COMPLETED');
+    assert.equal(h.maxMemGB, 3);
   });
   test('resource_report aggregation: peak memory comes from step rows', () => {
     const raw = [
@@ -354,22 +359,29 @@ describe('watch file hygiene (BUG-5, B5)', () => {
   const now = Date.parse('2026-09-27T12:00:00Z');
   const iso = (ms) => new Date(ms).toISOString();
   test('isValidWatch rejects null / non-objects / bad jobId / bad host', () => {
-    for (const w of [null, 1, 'x', [], {}, { jobId: 5 }, { jobId: '5;rm' }, { jobId: '5', host: '' }, { jobId: '5', host: 3 }]) {
+    for (const w of [null, 1, 'x', [], {}, { jobId: 5.5 }, { jobId: -1 }, { jobId: '5;rm' }, { jobId: '5', host: '' }, { jobId: '5', host: 3 },
+      { jobId: '5', host: 'mp;rm' }, { jobId: '5', host: '-oProxyCommand=x' }, { jobId: '5', host: 'a b' }]) {
       assert.equal(M.isValidWatch(w), false, JSON.stringify(w));
     }
     assert.equal(M.isValidWatch({ jobId: '541806' }), true);
     assert.equal(M.isValidWatch({ jobId: '541806', host: 'mp' }), true);
+    assert.equal(M.isValidWatch({ jobId: '541806', host: 'u@login.hpc.edu' }), true);
   });
-  test('a long-queued job that sacct still reports never expires', () => {
-    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 30 * 24 * H), lastSeenAt: iso(now - 1 * H), estimatedSeconds: 900 }, now), false);
+  test('numeric jobId is accepted, not dropped (R8)', () => {
+    assert.equal(M.isValidWatch({ jobId: 541806 }), true);
+    assert.equal(M.isValidWatch({ jobId: 541806, host: 'mp' }), true);
   });
-  test('expires after max(48h, 4×estimate) without being seen', () => {
-    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 49 * H), estimatedSeconds: 900 }, now), true);
-    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 47 * H), estimatedSeconds: 900 }, now), false);
-    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 30 * 24 * H), lastSeenAt: iso(now - 49 * H), estimatedSeconds: 900 }, now), true);
+  test('never expires without unseenSince, whatever its age (R4: master outage)', () => {
+    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 30 * 24 * H), estimatedSeconds: 900 }, now), false);
+    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 30 * 24 * H), lastSeenAt: iso(now - 29 * 24 * H), estimatedSeconds: 900 }, now), false);
+  });
+  test('expires after max(48h, 4×estimate) of successful polls not seeing the job (R4)', () => {
+    assert.equal(M.isWatchExpired({ unseenSince: iso(now - 49 * H), estimatedSeconds: 900 }, now), true);
+    assert.equal(M.isWatchExpired({ unseenSince: iso(now - 47 * H), estimatedSeconds: 900 }, now), false);
     // 2-day time limit → 8-day TTL
-    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 7 * 24 * H), estimatedSeconds: 2 * 86400 }, now), false);
-    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 9 * 24 * H), estimatedSeconds: 2 * 86400 }, now), true);
+    assert.equal(M.isWatchExpired({ unseenSince: iso(now - 7 * 24 * H), estimatedSeconds: 2 * 86400 }, now), false);
+    assert.equal(M.isWatchExpired({ unseenSince: iso(now - 9 * 24 * H), estimatedSeconds: 2 * 86400 }, now), true);
+    assert.equal(M.isWatchExpired({ unseenSince: 'garbage', estimatedSeconds: 900 }, now), false);
   });
 });
 
@@ -467,23 +479,78 @@ describe('withFileLock', () => {
     assert.equal(M.withFileLock(p, () => 'ran'), 'ran');
     assert.deepEqual(readdirSync(dir).filter(f => f.startsWith('e.json')), []);
   });
-  test('reclaim decided on an old stat never steals a fresh lock (BUG-11 race)', () => {
+  test('slower reclaimer of the same dead owner never steals the fresh lock (BUG-11 race, R3)', () => {
     const p = join(dir, 'f.json');
     const lockDir = `${p}.lock`;
     mkdirSync(lockDir);
+    writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: DEAD_PID, host: hostname(), at: Date.now(), token: 'x' }));
+    assert.equal(M.isLockStale(lockDir), true, 'both waiters judge it stale');
+    // The first waiter reclaims and takes a fresh lock (live owner).
+    assert.equal(M.reclaimStaleLock(lockDir), true);
+    mkdirSync(lockDir);
+    writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, host: hostname(), at: Date.now(), token: 'winner' }));
+    // The slower waiter acts on its earlier judgement: re-checked, refused.
+    assert.equal(M.reclaimStaleLock(lockDir), false);
+    assert.equal(M.readLockOwner(lockDir).token, 'winner', 'fresh lock survives');
+    assert.deepEqual(readdirSync(dir).filter(f => f.startsWith('f.json.lock.')), [], 'no .stale-/.reclaim leftovers');
+    rmSync(lockDir, { recursive: true });
+  });
+  test('dead owner pid: reclaimed at once, even with a fresh mtime (R3)', () => {
+    const p = join(dir, 'g.json');
+    mkdirSync(`${p}.lock`);
+    writeFileSync(join(`${p}.lock`, 'owner.json'), JSON.stringify({ pid: DEAD_PID, host: hostname(), at: Date.now(), token: 'dead' }));
+    const t0 = Date.now();
+    assert.equal(M.withFileLock(p, () => 'ran'), 'ran');
+    assert.ok(Date.now() - t0 < 1000, `no 2s wait (${Date.now() - t0}ms)`);
+    assert.equal(existsSync(`${p}.lock`), false);
+  });
+  test('live owner is never preempted, even with an old mtime: fail-open at the deadline (R3)', () => {
+    const p = join(dir, 'h.json');
+    const lockDir = `${p}.lock`;
+    mkdirSync(lockDir);
+    const owner = JSON.stringify({ pid: process.pid, host: hostname(), at: Date.now() - 60_000, token: 'live' });
+    writeFileSync(join(lockDir, 'owner.json'), owner);
     const old = (Date.now() - 60_000) / 1000;
     utimesSync(lockDir, old, old);
-    const staleStat = statSync(lockDir);
-    // Another waiter reclaims the stale lock and takes a fresh one meanwhile.
-    const winnerAside = M.reclaimStaleLock(lockDir, staleStat);
-    assert.ok(winnerAside, 'first reclaimer wins');
-    mkdirSync(lockDir); // winner's fresh lock (aside still exists, so a new inode)
-    // The slower waiter acts on its stale observation: must not remove it.
-    assert.equal(M.reclaimStaleLock(lockDir, staleStat), null);
-    assert.equal(existsSync(lockDir), true, 'fresh lock survives');
-    assert.ok(Date.now() - statSync(lockDir).mtimeMs < 10_000, 'still the fresh lock');
-    assert.deepEqual(readdirSync(dir).filter(f => f.startsWith('f.json.lock.stale-') && join(dir, f) !== winnerAside), []);
-    rmdirSync(winnerAside); rmdirSync(lockDir);
+    const t0 = Date.now();
+    assert.equal(M.withFileLock(p, () => 'ran'), 'ran');
+    const dt = Date.now() - t0;
+    assert.ok(dt >= 1900 && dt < 5000, `waited ${dt}ms`);
+    assert.equal(readFileSync(join(lockDir, 'owner.json'), 'utf8'), owner, 'holder lock untouched');
+    rmSync(lockDir, { recursive: true });
+  });
+  test('the holder writes owner.json with its pid while it holds the lock (R3)', () => {
+    const p = join(dir, 'i.json');
+    M.withFileLock(p, () => {
+      const o = M.readLockOwner(`${p}.lock`);
+      assert.equal(o.pid, process.pid);
+      assert.equal(M.isLockStale(`${p}.lock`), false);
+    });
+    assert.equal(existsSync(`${p}.lock`), false);
+  });
+  test('two waiters + one dead owner: exactly one reclaim, no lost update (R3)', async () => {
+    const p = join(dir, 'counter2.json');
+    writeFileSync(p, '{"n":0}');
+    mkdirSync(`${p}.lock`);
+    writeFileSync(join(`${p}.lock`, 'owner.json'), JSON.stringify({ pid: DEAD_PID, host: hostname(), at: Date.now(), token: 'dead' }));
+    const N = 40;
+    const script = `
+      const M = await import(${JSON.stringify(pathToFileURL(join(ROOT, 'index.mjs')).href)});
+      for (let i = 0; i < ${N}; i++) M.withFileLock(${JSON.stringify(p)}, () => {
+        const d = M.readJsonOrQuarantine(${JSON.stringify(p)}, null);
+        M.atomicWriteJson(${JSON.stringify(p)}, { n: d.n + 1 });
+      });`;
+    const run = () => new Promise((res, rej) => {
+      const c = spawn(process.execPath, ['--input-type=module', '-e', script], { env: process.env, stdio: ['ignore', 'ignore', 'pipe'] });
+      let err = ''; c.stderr.on('data', d => { err += d; });
+      c.on('exit', code => (code === 0 ? res(err) : rej(new Error(`child exit ${code}: ${err}`))));
+    });
+    const t0 = Date.now();
+    const errs = await Promise.all([run(), run()]);
+    assert.deepEqual(JSON.parse(readFileSync(p, 'utf8')), { n: 2 * N });
+    assert.ok(!errs.join('').includes('fail-open'), 'nobody had to fail open');
+    assert.ok(Date.now() - t0 < 10_000);
+    assert.deepEqual(readdirSync(dir).filter(f => f.startsWith('counter2.json.lock')), []);
   });
   test('two processes doing read-modify-write never lose an update', async () => {
     const p = join(dir, 'counter.json');
@@ -514,5 +581,89 @@ describe('validatePath / validateSession', () => {
   test('validateSession', () => {
     assert.equal(M.validateSession('hpc-1_a'), 'hpc-1_a');
     assert.throws(() => M.validateSession('a b'), /Invalid session name/);
+  });
+});
+
+describe('env whitelists (R1)', () => {
+  test('RE_HOST accepts aliases, FQDNs and user@host; rejects options and shell', () => {
+    for (const h of ['mp', 'login.hpc.example.edu', 'user@host', 'u.x@login-01.hpc.edu', 'm3_b']) assert.equal(M.RE_HOST.test(h), true, h);
+    for (const h of ['-oProxyCommand=x', '-x', 'a b', 'a;b', 'u@', '@h', 'u@-h x', 'a@b@c', '']) assert.equal(M.RE_HOST.test(h), false, h);
+  });
+  test('RE_USER accepts AD/LDAP/Kerberos names; rejects options and shell', () => {
+    for (const u of ['tzheng', 'u@ad.example.edu', 'DOMAIN\\u', 'first.last', 'a-b_c']) assert.equal(M.RE_USER.test(u), true, u);
+    for (const u of ['-oProxyCommand=x', 'u$(id)', "u'x", 'a b', 'u;x', '']) assert.equal(M.RE_USER.test(u), false, u);
+  });
+  test('RE_PARTITION accepts "gpu.a100", rejects a leading "-"', () => {
+    for (const v of ['batch', 'gpu.a100', 'short-1']) assert.equal(M.RE_PARTITION.test(v), true, v);
+    for (const v of ['-p', 'a;b', 'a b', '']) assert.equal(M.RE_PARTITION.test(v), false, v);
+  });
+  test('shq single-quotes for bash, including backslash and quote', () => {
+    assert.equal(M.shq('DOMAIN\\u'), "'DOMAIN\\u'");
+    assert.equal(M.shq("it's"), "'it'\\''s'");
+    const out = spawnSync('bash', ['-c', `printf %s ${M.shq("DOMAIN\\u@x'y")}`], { encoding: 'utf8' }).stdout;
+    assert.equal(out, "DOMAIN\\u@x'y");
+  });
+});
+
+describe('sacctSinceDate (R10)', () => {
+  test('YYYY-MM-DD, days before now, computed locally (no GNU date -d)', () => {
+    const now = new Date(2026, 8, 27, 12, 0, 0).getTime(); // local 2026-09-27
+    assert.equal(M.sacctSinceDate(7, now), '2026-09-20');
+    assert.equal(M.sacctSinceDate(0, now), '2026-09-27');
+    assert.equal(M.sacctSinceDate(30, now), '2026-08-28');
+    assert.match(M.sacctSinceDate(7), /^\d{4}-\d{2}-\d{2}$/);
+  });
+});
+
+describe('heartbeat ownership (R5)', () => {
+  test('shutdown removes the heartbeat only when it is still ours', () => {
+    M.writeHeartbeat();
+    const files = readdirSync(M.HEARTBEAT_DIR);
+    assert.equal(files.length, 1);
+    const hb = join(M.HEARTBEAT_DIR, files[0]);
+    // A new server in the same tty has taken over the heartbeat.
+    writeFileSync(hb, JSON.stringify({ pid: process.pid + 100000, at: Date.now() }));
+    assert.equal(M.removeOwnHeartbeat(), false);
+    assert.equal(existsSync(hb), true, "the other server's heartbeat survives");
+    M.writeHeartbeat();
+    assert.equal(M.removeOwnHeartbeat(), true);
+    assert.equal(existsSync(hb), false);
+  });
+});
+
+describe('per-host poll backoff (R6)', () => {
+  test('a failing host backs off alone; the loop keeps the base interval', () => {
+    const base = M.currentPollDelay();
+    const now = Date.now();
+    const st = M.noteHostFailure('hostA', 'dead', now);
+    M.noteHostFailure('hostA', 'dead', now);
+    assert.equal(st.failures, 2);
+    assert.equal(M.hostPollDue('hostA', now + 10), false, 'hostA skipped while backing off');
+    assert.equal(M.hostPollDue('hostB', now + 10), true, 'hostB unaffected');
+    assert.equal(M.currentPollDelay(), base, 'loop delay unchanged by a host failure');
+    assert.deepEqual(Object.keys(M.pollState().hostBackoff), ['hostA']);
+    M.noteHostSuccess('hostA');
+    assert.equal(M.hostPollDue('hostA', now + 10), true);
+    assert.deepEqual(M.pollState().hostBackoff, {});
+  });
+});
+
+describe('tmux send-keys (R12)', () => {
+  test('text is literal and after "--"; key names are keys', () => {
+    assert.deepEqual(M.sendKeysArgs('hpc', '-n hi'), ['send-keys', '-t', 'hpc', '-l', '--', '-n hi']);
+    assert.deepEqual(M.sendKeysArgs('hpc', 'Enter', { key: true }), ['send-keys', '-t', 'hpc', '--', 'Enter']);
+    assert.equal(M.tmuxKeyName('Enter'), 'Enter');
+    assert.equal(M.tmuxKeyName('Ctrl-C'), 'C-c');
+    assert.equal(M.tmuxKeyName('C-d'), 'C-d');
+    assert.equal(M.tmuxKeyName('echo Enter'), null);
+    assert.equal(M.tmuxKeyName('-t other'), null);
+  });
+});
+
+describe('gresHint (R13)', () => {
+  test('only sbatch stderr about gres/GPU triggers the hint', () => {
+    assert.match(M.gresHint({ stderr: 'sbatch: error: Invalid generic resource (gres) specification' }), /SLURM_DEFAULT_GPUS=0 or pass gpus:0/);
+    assert.equal(M.gresHint({ stderr: 'sbatch: error: Invalid account', message: '... #SBATCH --gres=gpu:1 ...' }), '');
+    assert.equal(M.gresHint(new Error('x')), '');
   });
 });

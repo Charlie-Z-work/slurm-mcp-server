@@ -7,10 +7,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { execSync, execFileSync, spawnSync, execFile as execFileCb } from 'child_process';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync, rmdirSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync, rmdirSync, rmSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { randomBytes } from 'crypto';
-import { homedir } from 'os';
+import { homedir, hostname } from 'os';
 import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 
@@ -32,15 +32,31 @@ function requireEnv(name) {
 // commands (`sacct -u USER`), #SBATCH headers and local ssh argv. A typo like
 // "mp m3" or a stray quote must stop the server at startup with a clear error
 // instead of producing broken or injectable commands later.
-const RE_ENV_TOKEN = /^[\w.-]+$/;
-function requireEnvList(name) {
-  const items = requireEnv(name).split(',').map(s => s.trim());
-  const bad = items.filter(s => !RE_ENV_TOKEN.test(s));
+// A leading "-" is never allowed: every value may end up as an argv element of
+// ssh/rsync/tmux, where it would be parsed as an option (-oProxyCommand=...).
+// HPC_HOST: ssh alias / hostname, optionally "user@host".
+const RE_HOST = /^(?!-)[\w.-]+(@(?!-)[\w.-]+)?$/;
+// HPC_USER: AD/LDAP/Kerberos names may contain "@" or "\" (u@ad.example.edu,
+// DOMAIN\u). Always single-quoted when interpolated into a remote command.
+const RE_USER = /^(?!-)[\w.@\\-]+$/;
+// SLURM_ACCOUNT
+const RE_ENV_TOKEN = /^(?!-)[\w.-]+$/;
+function requireEnvList(name, re, allowed) {
+  return parseEnvList(name, requireEnv(name), re, allowed);
+}
+function parseEnvList(name, raw, re, allowed) {
+  const items = raw.split(',').map(s => s.trim());
+  const bad = items.filter(s => !re.test(s));
   if (bad.length) {
-    process.stderr.write(`[slurm-mcp-server] ERROR: ${name} contains an invalid entry ${JSON.stringify(bad[0])} (allowed: letters, digits, _ . -; comma-separated for multiple clusters)\n`);
+    process.stderr.write(`[slurm-mcp-server] ERROR: ${name} contains an invalid entry ${JSON.stringify(bad[0])} (allowed: ${allowed}, no leading "-"; comma-separated for multiple clusters)\n`);
     process.exit(1);
   }
   return items;
+}
+
+// Single-quote a value for a remote bash command line.
+function shq(s) {
+  return `'${String(s).replace(/'/g, "'\\''")}'`;
 }
 
 // Path validation: block shell metacharacters and traversal
@@ -72,7 +88,12 @@ if (RESOURCE_LOG_PATH) {
 // Site defaults for slurm_submit. Not every cluster has a "batch" partition or
 // GPUs: SLURM_DEFAULT_GPUS=0 omits --gres entirely.
 const DEFAULT_PARTITION = process.env.SLURM_DEFAULT_PARTITION || 'batch';
-if (!/^[\w-]+$/.test(DEFAULT_PARTITION)) envError(`SLURM_DEFAULT_PARTITION ${JSON.stringify(DEFAULT_PARTITION)} must match [A-Za-z0-9_-]+`);
+// Same whitelist as the slurm_submit `partition` parameter (e.g. "gpu.a100").
+const RE_PARTITION = /^(?!-)[\w.-]+$/;
+if (!RE_PARTITION.test(DEFAULT_PARTITION)) envError(`SLURM_DEFAULT_PARTITION ${JSON.stringify(DEFAULT_PARTITION)} must match [A-Za-z0-9_.-]+ (no leading "-")`);
+// HPC_REQUIRE_MASTER=1: treat "no ControlMaster configured" like a dead master
+// (MFA clusters, where a direct connection can never authenticate).
+const REQUIRE_MASTER = process.env.HPC_REQUIRE_MASTER === '1';
 const DEFAULT_GPUS = process.env.SLURM_DEFAULT_GPUS == null || process.env.SLURM_DEFAULT_GPUS === ''
   ? 1 : Number(process.env.SLURM_DEFAULT_GPUS);
 if (!Number.isInteger(DEFAULT_GPUS) || DEFAULT_GPUS < 0) envError(`SLURM_DEFAULT_GPUS ${JSON.stringify(process.env.SLURM_DEFAULT_GPUS)} must be a non-negative integer (0 = do not request GPUs)`);
@@ -135,55 +156,104 @@ function sleepSync(ms) {
 // Why: atomic writes alone still lose updates when two processes do
 // read-modify-write concurrently (e.g. poller removes a finished watch while
 // another window registers a new one). mkdir is atomic, so a lock directory is
-// a portable cross-process mutex. Fail-open after ~2s: a stuck lock must never
-// block job submission or notifications — worst case is the old racy behavior.
-// Reclaim a stale lock dir that was observed (statSync) as `observed`.
-// Why rename instead of rmdir: two waiters can both see the same stale lock;
-// with rmdir the slower one could delete the fresh lock the faster one had
-// just created. rename is atomic (only one waiter moves a given dir), and the
-// inode + mtime check detects that what we moved is no longer the stale dir we
-// judged — in that case it is put back. Returns the path of the moved-aside
-// dir (caller removes it after taking its own lock, so the inode cannot be
-// reused by that fresh lock), or null when nothing was reclaimed.
-function reclaimStaleLock(lockDir, observed) {
-  const aside = `${lockDir}.stale-${process.pid}-${randomBytes(4).toString('hex')}`;
-  try { renameSync(lockDir, aside); } catch { return null; } // another waiter won
-  let moved;
-  try { moved = statSync(aside); } catch { return null; }
-  if (moved.ino !== observed.ino || moved.mtimeMs !== observed.mtimeMs) {
-    // We moved a fresh lock that replaced the stale one: give it back.
-    try { renameSync(aside, lockDir); } catch (err) { logDebug(`reclaimStaleLock: restore failed: ${err.message}`); }
-    return null;
+// a portable cross-process mutex. Fail-open after LOCK_WAIT_MS: a stuck lock
+// must never block job submission or notifications — worst case is the old
+// racy behavior.
+//
+// The holder writes owner.json ({pid, host, at, token}) into the lock dir.
+// A lock is stale only when its owner is provably gone: same machine and the
+// pid no longer exists (ESRCH). A live owner is never preempted, however long
+// it holds the lock — waiters fail open at the deadline instead. Only an
+// owner-less lock (legacy server version, or a crash between mkdir and the
+// owner write) falls back to age: mtime older than LOCK_OWNERLESS_STALE_MS,
+// the same threshold older versions use, so mixed versions agree.
+const LOCK_WAIT_MS = 2000;
+const LOCK_OWNERLESS_STALE_MS = 10_000;
+const LOCK_OWNER_FILE = 'owner.json';
+const LOCAL_HOSTNAME = hostname();
+
+function readLockOwner(lockDir) {
+  try {
+    const o = JSON.parse(readFileSync(join(lockDir, LOCK_OWNER_FILE), 'utf-8'));
+    return o && Number.isInteger(o.pid) && o.pid > 0 ? o : null;
+  } catch { return null; }
+}
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (err) { return err.code !== 'ESRCH'; } // EPERM: alive, other user
+}
+
+function isLockStale(lockDir, now = Date.now()) {
+  const owner = readLockOwner(lockDir);
+  if (owner) {
+    // A pid from another machine (shared/NFS home) says nothing about
+    // liveness here; fall back to the owner's age.
+    if (owner.host && owner.host !== LOCAL_HOSTNAME) return now - Number(owner.at) > LOCK_OWNERLESS_STALE_MS;
+    return !pidAlive(owner.pid);
   }
-  return aside;
+  let st;
+  try { st = statSync(lockDir); } catch { return false; } // gone: just retry mkdir
+  return now - st.mtimeMs > LOCK_OWNERLESS_STALE_MS;
+}
+
+// Remove a stale lock. Returns true when it was removed.
+// Why a separate `.reclaim` guard: two waiters can judge the same dead owner
+// stale; without serialization the slower one could move away the fresh lock
+// the faster one had just taken. Under the guard the staleness is re-checked,
+// so the second reclaimer sees the new (live) owner and backs off. The stale
+// dir is renamed aside and deleted — never put back (putting back could
+// overwrite a lock a third process created in the meantime).
+function reclaimStaleLock(lockDir) {
+  const guard = `${lockDir}.reclaim`;
+  try { mkdirSync(guard); } catch (err) {
+    if (err.code === 'EEXIST') {
+      // A reclaimer that died inside this few-ms section leaves its guard.
+      try { if (Date.now() - statSync(guard).mtimeMs > LOCK_OWNERLESS_STALE_MS) rmdirSync(guard); } catch { /* raced */ }
+    }
+    return false;
+  }
+  try {
+    if (!isLockStale(lockDir)) return false;
+    const aside = `${lockDir}.stale-${process.pid}-${randomBytes(4).toString('hex')}`;
+    try { renameSync(lockDir, aside); } catch { return false; } // already gone
+    try { rmSync(aside, { recursive: true, force: true }); } catch (err) { logDebug(`reclaimStaleLock: cleanup failed: ${err.message}`); }
+    return true;
+  } finally {
+    try { rmdirSync(guard); } catch { /* already gone */ }
+  }
 }
 
 function withFileLock(path, fn) {
   const lockDir = `${path}.lock`;
-  const deadline = Date.now() + 2000;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  const token = randomBytes(6).toString('hex');
   let locked = false;
-  const asides = [];
   try { mkdirSync(dirname(path), { recursive: true }); } catch { /* surfaces below */ }
   for (;;) {
-    try { mkdirSync(lockDir); locked = true; break; } catch (err) {
-      if (err.code !== 'EEXIST') { logDebug(`withFileLock(${path}): ${err.message}`); break; }
-      // Stale lock left by a crashed holder (critical sections take ms) — reclaim.
+    try {
+      mkdirSync(lockDir);
+      locked = true;
       try {
-        const st = statSync(lockDir);
-        if (Date.now() - st.mtimeMs > 10_000) {
-          const aside = reclaimStaleLock(lockDir, st);
-          if (aside) { asides.push(aside); continue; }
-          // Not reclaimed (lost the race / put back): wait like any waiter.
-        }
-      } catch { /* raced with the holder releasing it — just retry */ }
+        writeFileSync(join(lockDir, LOCK_OWNER_FILE), JSON.stringify({ pid: process.pid, host: LOCAL_HOSTNAME, at: Date.now(), token }));
+      } catch (err) { logDebug(`withFileLock(${path}): owner write failed: ${err.message}`); }
+      break;
+    } catch (err) {
+      if (err.code !== 'EEXIST') { logDebug(`withFileLock(${path}): ${err.message}`); break; }
+      if (isLockStale(lockDir) && reclaimStaleLock(lockDir)) continue;
       if (Date.now() > deadline) break;
       sleepSync(25);
     }
   }
-  for (const a of asides) { try { rmdirSync(a); } catch { /* already gone */ } }
-  if (!locked) logDebug(`withFileLock(${path}): lock not acquired within 2s, proceeding unlocked (fail-open)`);
+  if (!locked) logDebug(`withFileLock(${path}): lock not acquired within ${LOCK_WAIT_MS}ms, proceeding unlocked (fail-open)`);
   try { return fn(); } finally {
-    if (locked) { try { rmdirSync(lockDir); } catch { /* already gone */ } }
+    if (locked) {
+      // Only remove our own lock: if it was (wrongly) reclaimed meanwhile, the
+      // dir now belongs to someone else.
+      const owner = readLockOwner(lockDir);
+      if (!owner || owner.token === token) {
+        try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* already gone */ }
+      }
+    }
   }
 }
 
@@ -235,28 +305,32 @@ function saveNotifications(notifs) {
   }
 }
 
-// A watch is only dropped when nobody has seen the job for a long time.
-// Why lastSeenAt: the old TTL counted from submission, so a job that queued
-// for days (busy partition) silently lost its watch before it even started.
-// As long as sacct keeps returning the job, lastSeenAt is refreshed and the
-// watch never expires.
+// A watch is only dropped when the job has been missing from a SUCCESSFUL
+// sacct query of its cluster for a long time. `unseenSince` is set on the
+// first successful poll that does not return the job and cleared as soon as
+// the job shows up again. Why not "time since last seen": while the master is
+// dead (or sacct fails) nothing is known about the job, and a long outage
+// (weekend without Duo) used to expire every watch of that cluster.
+// Old fields (submittedAt, lastSeenAt) no longer affect expiry.
 const WATCH_MIN_TTL_MS = 48 * 3600 * 1000;
 function isWatchExpired(w, now = Date.now()) {
-  const submitted = new Date(w.submittedAt).getTime();
-  const seen = w.lastSeenAt ? new Date(w.lastSeenAt).getTime() : NaN;
-  const ref = Math.max(Number.isFinite(submitted) ? submitted : 0, Number.isFinite(seen) ? seen : 0);
+  const unseen = w.unseenSince ? new Date(w.unseenSince).getTime() : NaN;
+  if (!Number.isFinite(unseen)) return false;
   const ttlMs = Math.max(WATCH_MIN_TTL_MS, 4 * (Number(w.estimatedSeconds) || 0) * 1000);
-  return now - ref > ttlMs;
+  return now - unseen > ttlMs;
 }
 
 // Why: the file is shared by every window's server and user-editable; a
 // valid JSON array can still hold null/garbage entries. One bad element used
 // to throw inside registerWatch (after sbatch had succeeded → "Submit failed"
-// → duplicate jobs) and in every poll cycle.
+// → duplicate jobs) and in every poll cycle. A numeric jobId (hand-edited
+// file) is accepted and normalized to a string by loadWatches.
 function isValidWatch(w) {
-  return !!w && typeof w === 'object' && !Array.isArray(w) &&
-    typeof w.jobId === 'string' && /^\d+$/.test(w.jobId) &&
-    (w.host == null || (typeof w.host === 'string' && w.host.length > 0));
+  if (!w || typeof w !== 'object' || Array.isArray(w)) return false;
+  const idOk = (typeof w.jobId === 'string' && /^\d+$/.test(w.jobId)) ||
+    (typeof w.jobId === 'number' && Number.isSafeInteger(w.jobId) && w.jobId >= 0);
+  // host reaches `ssh -O check <host>` / ssh argv: same whitelist as HPC_HOST.
+  return idOk && (w.host == null || (typeof w.host === 'string' && RE_HOST.test(w.host)));
 }
 
 function loadWatches() {
@@ -264,6 +338,7 @@ function loadWatches() {
   const now = Date.now();
   return data.filter(w => {
     if (!isValidWatch(w)) { logDebug(`Ignoring malformed watch entry: ${JSON.stringify(w)?.slice(0, 200)}`); return false; }
+    if (typeof w.jobId === 'number') w.jobId = String(w.jobId);
     return !isWatchExpired(w, now);
   });
 }
@@ -293,6 +368,19 @@ function writeHeartbeat() {
     writeFileSync(join(HEARTBEAT_DIR, `${windowTty}.json`),
       JSON.stringify({ pid: process.pid, at: Date.now() }));
   } catch (err) { logDebug(`writeHeartbeat failed: ${err.message}`); }
+}
+
+// Remove this server's heartbeat on shutdown — but only if it is still ours:
+// a new server in the same tty (client restart) may already have replaced it,
+// and deleting that would get its live watches adopted by other windows.
+function removeOwnHeartbeat() {
+  const hbPath = join(HEARTBEAT_DIR, `${windowTty}.json`);
+  try {
+    const hb = JSON.parse(readFileSync(hbPath, 'utf-8'));
+    if (hb?.pid !== process.pid) return false;
+    unlinkSync(hbPath);
+    return true;
+  } catch { return false; }
 }
 
 function pollerAlive(tty) {
@@ -624,25 +712,66 @@ function formatWatchStatus(watches) {
 // SLURM_MCP_POLL_MS: test hook to shorten the cycle (default unchanged: 30s).
 const POLL_INTERVAL = Number(process.env.SLURM_MCP_POLL_MS) > 0 ? Number(process.env.SLURM_MCP_POLL_MS) : 30_000;
 const POLL_BACKOFF_MAX = 600_000; // 10 min cap under sustained failure
+// Consecutive poll cycles that crashed (not per-host failures, see below).
 let consecutivePollFailures = 0;
 
+// Per-host backoff. Why per host: one cluster with a dead master used to
+// back off the whole loop (up to 10 min), delaying notifications for jobs on
+// every other, healthy cluster. A failing host is skipped — no ssh at all, not
+// even `ssh -O check` — until its own nextAt; the others keep the base cycle.
+const hostBackoff = new Map(); // host → { failures, nextAt, error }
+
+function hostBackoffDelay(failures) {
+  return Math.min(POLL_INTERVAL * 2 ** failures, POLL_BACKOFF_MAX);
+}
+function noteHostFailure(host, error, now = Date.now()) {
+  const st = hostBackoff.get(host) || { failures: 0, nextAt: 0, error: null };
+  st.failures++;
+  const delay = hostBackoffDelay(st.failures);
+  st.nextAt = now + delay;
+  st.error = `${error} (backoff ${Math.round(delay / 1000)}s)`;
+  hostBackoff.set(host, st);
+  return st;
+}
+function noteHostSuccess(host) {
+  hostBackoff.delete(host);
+}
+function hostPollDue(host, now = Date.now()) {
+  const st = hostBackoff.get(host);
+  return !st || now >= st.nextAt;
+}
+
+// Delay until the next cycle: the smallest delay over all hosts. A healthy
+// host — or one that has no backoff state yet, e.g. a watch another window
+// just registered — always needs the base interval, so this is POLL_INTERVAL;
+// a cycle waking up with every host still backing off costs one local file
+// read and no network traffic. Only crashing cycles back the loop itself off.
 function currentPollDelay() {
   return Math.min(POLL_INTERVAL * 2 ** consecutivePollFailures, POLL_BACKOFF_MAX);
 }
 
-// Local-only liveness probe of the shared ControlMaster socket (no network,
-// no auth attempt). Chained MFA (publickey+Duo) means a background process
-// can NEVER re-authenticate — dead master ⇒ pause, tell the human.
-function masterAlive(host) {
-  // execFileSync, not a shell string: `host` comes from the shared watch file.
-  try {
-    execFileSync('ssh', ['-O', 'check', String(host)], { timeout: 3000, stdio: 'ignore' });
-    return true;
-  } catch { return false; }
+// Local-only probe of the shared ControlMaster socket (no network, no auth
+// attempt). Three states:
+//   alive        — exit 0
+//   unconfigured — "No ControlPath specified": the user runs without
+//                  ControlMaster. Direct `ssh -o BatchMode=yes` connections are
+//                  allowed (publickey without MFA works; BatchMode guarantees
+//                  no hang on an interactive prompt). HPC_REQUIRE_MASTER=1
+//                  turns this into `dead`.
+//   dead         — anything else (socket missing, "Control socket connect",
+//                  timeout). Chained MFA (publickey+Duo) means a background
+//                  process can NEVER re-authenticate — pause, tell the human.
+function probeMaster(host) {
+  // spawnSync with argv, not a shell string: `host` comes from the shared watch file.
+  const r = spawnSync('ssh', ['-O', 'check', String(host)], { timeout: 3000, encoding: 'utf8' });
+  const output = `${r.stdout || ''}${r.stderr || ''}`.trim();
+  if (r.status === 0) return { state: 'alive', output };
+  if (/No ControlPath specified/i.test(output)) return { state: REQUIRE_MASTER ? 'dead' : 'unconfigured', output };
+  return { state: 'dead', output };
 }
-
-// Refresh lastSeenAt at most this often (each refresh rewrites the watch file).
-const LAST_SEEN_REFRESH_MS = 5 * 60_000;
+function masterAlive(host) {
+  return probeMaster(host).state !== 'dead';
+}
 
 async function pollOnce() {
   // Orphan guard: if the parent Claude session died we get re-parented to
@@ -704,12 +833,12 @@ async function pollOnce() {
   }
 
   const stateMap = new Map(); // key: `${host}|${baseJobId}` → Map(unitKey → state)
-  let anyHostFailed = false;
+  const queriedHosts = new Set(); // hosts whose sacct succeeded this cycle
   for (const [host, hostWatches] of byHost) {
+    if (!hostPollDue(host)) continue; // backing off: no traffic, not even -O check
     if (!masterAlive(host)) {
-      anyHostFailed = true;
-      lastPollError = `SSH master to ${host} is dead — its watches paused (backoff ${Math.round(currentPollDelay() / 1000)}s). Reconnect interactively: run \`ssh ${host}\` in a terminal (needs Duo).`;
-      logDebug(lastPollError);
+      const st = noteHostFailure(host, `SSH master to ${host} is dead — its watches paused. Reconnect interactively: run \`ssh ${host}\` in a terminal (needs Duo).`);
+      logDebug(st.error);
       continue;
     }
     const jobIds = hostWatches.map(w => w.jobId).join(',');
@@ -721,24 +850,29 @@ async function pollOnce() {
       // Normalize "12345.batch" / "12345_7" / "12345_[8-10]" / "12345+1" to
       // the base id and collect every task/component state under it.
       for (const [baseId, units] of aggregateSacctRows(stdout)) stateMap.set(`${host}|${baseId}`, units);
+      queriedHosts.add(host);
+      noteHostSuccess(host);
     } catch (err) {
-      anyHostFailed = true;
-      lastPollError = `batch sacct (${host}): ${String(err?.message ?? err)} (backoff ${Math.round(currentPollDelay() / 1000)}s)`;
+      noteHostFailure(host, `batch sacct (${host}): ${String(err?.message ?? err)}`);
       logDebug(`Batch poll failed for ${host}: ${String(err?.message ?? err)}`);
     }
   }
-  if (anyHostFailed) consecutivePollFailures++; else consecutivePollFailures = 0;
+  const hostErrors = [...byHost.keys()].map(h => hostBackoff.get(h)?.error).filter(Boolean);
+  lastPollError = hostErrors.length ? hostErrors.join(' | ') : null;
 
-  const nowMs = Date.now();
+  const nowIso = new Date().toISOString();
   for (const w of myWatches) {
+    // Host not queried (dead master, sacct failed, backing off): nothing is
+    // known about the job — leave the watch, including unseenSince, untouched.
+    if (!queriedHosts.has(watchHost(w))) continue;
     const tasks = stateMap.get(watchKey(w));
-    if (!tasks || !tasks.size) continue; // UNKNOWN: host failed or sacct lag
-    // sacct still knows the job → keep the watch alive (see isWatchExpired).
-    const seen = w.lastSeenAt ? new Date(w.lastSeenAt).getTime() : 0;
-    if (!(nowMs - seen < LAST_SEEN_REFRESH_MS)) {
-      w.lastSeenAt = new Date(nowMs).toISOString();
-      stateChanged = true;
+    if (!tasks || !tasks.size) {
+      // sacct answered but does not report the job (sacct lag right after
+      // submit, or the job is long gone): start the expiry clock once.
+      if (!w.unseenSince) { w.unseenSince = nowIso; stateChanged = true; }
+      continue;
     }
+    if (w.unseenSince) { delete w.unseenSince; stateChanged = true; }
     const sum = summarizeJobRows(tasks);
     if (sum.allDone) {
       let delivered;
@@ -786,6 +920,7 @@ async function pollOnce() {
 async function safePoll(fn = pollOnce) {
   try {
     await fn();
+    consecutivePollFailures = 0;
   } catch (err) {
     lastPollError = `poll cycle crashed: ${String(err?.message ?? err)}`;
     consecutivePollFailures++;
@@ -794,7 +929,8 @@ async function safePoll(fn = pollOnce) {
 }
 
 function pollState() {
-  return { lastPollTime, lastPollError, pollCount, consecutivePollFailures };
+  const hosts = Object.fromEntries([...hostBackoff].map(([h, st]) => [h, { failures: st.failures, nextAt: st.nextAt }]));
+  return { lastPollTime, lastPollError, pollCount, consecutivePollFailures, hostBackoff: hosts };
 }
 
 function startHeartbeat() {
@@ -804,7 +940,8 @@ function startHeartbeat() {
 
 function startWatchPolling() {
   // setTimeout chain: wait for poll to finish before scheduling next.
-  // Delay is dynamic: exponential backoff under sustained failure.
+  // Delay is dynamic: exponential backoff only for crashing cycles; failing
+  // hosts back off individually inside pollOnce.
   (function scheduleNext() {
     setTimeout(async () => {
       try { await safePoll(); } finally { scheduleNext(); }
@@ -813,14 +950,19 @@ function startWatchPolling() {
 }
 
 // --- Multi-cluster: HPC_HOST can be comma-separated (e.g. "cluster1,cluster2") ---
-const HPC_HOSTS = requireEnvList('HPC_HOST');
-const HPC_USERS = requireEnvList('HPC_USER');
-const SLURM_ACCOUNTS = requireEnvList('SLURM_ACCOUNT');
+const HPC_HOSTS = requireEnvList('HPC_HOST', RE_HOST, 'letters, digits, _ . - and an optional user@ prefix');
+const HPC_USERS = requireEnvList('HPC_USER', RE_USER, 'letters, digits, _ . - @ \\');
+// Optional: many sites have a default account. Unset/empty → no
+// "#SBATCH --account" line; an empty entry in a list means "none" for that
+// cluster ("acct1,,acct3").
+const SLURM_ACCOUNTS = process.env.SLURM_ACCOUNT
+  ? parseEnvList('SLURM_ACCOUNT', process.env.SLURM_ACCOUNT, /^((?!-)[\w.-]+)?$/, 'letters, digits, _ . -')
+  : [''];
 
 // Default to first cluster
 let SSH_HOST = HPC_HOSTS[0];
-let SSH_USER = HPC_USERS.length > 1 ? HPC_USERS[0] : HPC_USERS[0];
-let SLURM_ACCOUNT = SLURM_ACCOUNTS.length > 1 ? SLURM_ACCOUNTS[0] : SLURM_ACCOUNTS[0];
+let SSH_USER = HPC_USERS[0];
+let SLURM_ACCOUNT = SLURM_ACCOUNTS[0] || null;
 
 function getClusterIndex(name) {
   if (!name) return 0;
@@ -832,7 +974,7 @@ function switchCluster(name) {
   const idx = getClusterIndex(name);
   SSH_HOST = HPC_HOSTS[idx];
   SSH_USER = HPC_USERS[Math.min(idx, HPC_USERS.length - 1)];
-  SLURM_ACCOUNT = SLURM_ACCOUNTS[Math.min(idx, SLURM_ACCOUNTS.length - 1)];
+  SLURM_ACCOUNT = SLURM_ACCOUNTS[Math.min(idx, SLURM_ACCOUNTS.length - 1)] || null;
   return SSH_HOST;
 }
 
@@ -934,13 +1076,16 @@ server.tool = function(...toolArgs) {
 // --- SSH ---
 
 server.tool('ssh_status', 'Check if SSH connection to HPC is active', {}, async () => {
-  // argv, not a shell string; `ssh -O check` reports on stderr.
-  const r = spawnSync('ssh', ['-O', 'check', SSH_HOST], { timeout: 5000, encoding: 'utf8' });
-  if (r.status === 0) {
-    const out = `${r.stdout || ''}${r.stderr || ''}`.trim();
-    return { content: [{ type: 'text', text: `SSH active: ${out}` }] };
+  const { state, output } = probeMaster(SSH_HOST);
+  if (state === 'alive') {
+    return { content: [{ type: 'text', text: `SSH active: ${output}` }] };
   }
-  return { content: [{ type: 'text', text: `SSH not connected. Run "ssh ${SSH_HOST}" in terminal to connect.` }] };
+  if (state === 'unconfigured') {
+    return { content: [{ type: 'text', text: `ControlMaster not configured — direct BatchMode connections to ${SSH_HOST}; for MFA clusters configure ControlMaster (see README).` }] };
+  }
+  const why = REQUIRE_MASTER && /No ControlPath specified/i.test(output)
+    ? ` (HPC_REQUIRE_MASTER=1 and no ControlPath is configured for ${SSH_HOST} — configure ControlMaster, see README)` : '';
+  return { content: [{ type: 'text', text: `SSH not connected${why}. Run "ssh ${SSH_HOST}" in terminal to connect.` }] };
 });
 
 // === Command Guard: reject prohibited patterns ===
@@ -1169,7 +1314,7 @@ server.tool('slurm_status', 'Check SLURM job status (squeue + sacct). For array 
       if (!squeue.ok && !sacct.ok) return { content: [{ type: 'text', text: `Error: ${text}` }], isError: true };
       return { content: [{ type: 'text', text }] };
     }
-    const out = sshExec(`squeue -u ${SSH_USER}`, 15000);
+    const out = sshExec(`squeue -u ${shq(SSH_USER)}`, 15000);
     return { content: [{ type: 'text', text: out || '(no jobs)' }] };
   } catch (e) {
     return { content: [{ type: 'text', text: `Error: ${String(e?.message ?? e)}` }], isError: true };
@@ -1195,19 +1340,28 @@ function firstLine(err) {
 // recent COMPLETED jobs whose name contains the pattern (case-insensitive, as
 // before); step 2 fetches all their rows including steps. Filtering is done
 // here, not with a remote `| grep`, so a failing sacct is an error, not "no data".
+// sacct -S start date "YYYY-MM-DD", `days` before `now` (local calendar).
+// Why computed here: `$(date -d '7 days ago')` is GNU-only and fails on
+// BSD/macOS-flavoured login nodes (or wherever `date` is not coreutils).
+function sacctSinceDate(days, now = Date.now()) {
+  const d = new Date(now - Math.max(0, Number(days) || 0) * 86400_000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 function queryResourceHistory(jobNamePattern, limit = 5) {
   const safe = String(jobNamePattern).replace(/[^a-zA-Z0-9._-]/g, '');
   if (!safe) return { status: 'empty', text: '' };
   let ids;
   try {
     const list = sshExec(
-      `sacct -u ${SSH_USER} -X -S $(date -d '7 days ago' +%Y-%m-%d) -o JobID,JobName%-64,State -P -n`,
+      `sacct -u ${shq(SSH_USER)} -X -S ${sacctSinceDate(7)} -o JobID,JobName%-64,State -P -n`,
       15000
     );
     const needle = safe.toLowerCase();
     ids = list.split('\n')
       .map(l => l.split('|').map(s => s.trim()))
-      .filter(([id, name, state]) => /^\d+(_\d+)?$/.test(id || '') && baseState(state) === 'COMPLETED' &&
+      .filter(([id, name, state]) => /^\d+(\+\d+)?(_\d+)?$/.test(id || '') && baseState(state) === 'COMPLETED' &&
         String(name || '').toLowerCase().includes(needle))
       .map(([id]) => id)
       .slice(-limit);
@@ -1237,10 +1391,15 @@ function parseElapsed(s) {
 /**
  * Memory string → MB. Accepts K/M/G/T/P suffixes (optional "B"/"iB"), decimals
  * ("1.50G") and the old ReqMem per-node/per-cpu suffix ("4Gn", "500Mc").
- * `bareUnit` is the unit of a suffix-less number: sacct's MaxRSS prints bytes,
- * while a --mem request without suffix is MB. Returns null if unparsable.
+ * `bareUnit` is the unit of a suffix-less number. For sacct values (MaxRSS,
+ * the default) it is KB: sacct reports memory in KB-based units and normally
+ * prints a suffix ("1201368K"); a bare number is rare (e.g. "0", or some
+ * --noconvert setups) and KB is the conservative reading — assuming bytes
+ * would under-state the peak 1024×, and the recommendation derived from it
+ * would OOM. A --mem request without suffix is MB (pass 'M').
+ * Returns null if unparsable.
  */
-function parseMemToMB(str, bareUnit = 'B') {
+function parseMemToMB(str, bareUnit = 'K') {
   const m = String(str ?? '').trim().match(/^(\d+(?:\.\d+)?)(?:([KMGTP])(?:i?B)?)?([nc])?$/i);
   if (!m) return null;
   const mult = { B: 1 / (1024 * 1024), K: 1 / 1024, M: 1, G: 1024, T: 1024 ** 2, P: 1024 ** 3 }[(m[2] || bareUnit).toUpperCase()];
@@ -1448,7 +1607,7 @@ function partitionLimitHints(args, timeSec) {
     let busy = !!args.array;
     if (!busy) {
       try {
-        busy = parseInt(sshExec(`squeue -u ${SSH_USER} -p ${args.partition} -h | wc -l`, 10000), 10) > 0;
+        busy = parseInt(sshExec(`squeue -u ${shq(SSH_USER)} -p ${args.partition} -h | wc -l`, 10000), 10) > 0;
       } catch { /* unknown — stay quiet */ }
     }
     if (busy) {
@@ -1474,7 +1633,7 @@ function partitionLimitHints(args, timeSec) {
 // shell line of a generated script, so anything outside these shapes is
 // rejected rather than escaped.
 const RE_JOB_NAME = /^[\w.-]{1,64}$/;
-const RE_PARTITION = /^[\w-]+$/;
+// RE_PARTITION is defined next to SLURM_DEFAULT_PARTITION (same whitelist).
 const RE_MEM = /^\d+[KMGT]?$/;
 // Ranges may carry a step ("1-10:2"), as sbatch accepts.
 const RE_ARRAY = /^\d+(-\d+(:\d+)?)?(,\d+(-\d+(:\d+)?)?)*(%\d+)?$/;
@@ -1497,6 +1656,17 @@ function validateSubmitArgs(args) {
   const odErr = validatePath(String(args.output_dir), 'output_dir') || (/['"\s]/.test(String(args.output_dir)) ? 'output_dir contains quotes or whitespace' : null);
   if (odErr) errs.push(odErr);
   return errs;
+}
+
+// sbatch rejected the GPU request: the default gpus=1 (SLURM_DEFAULT_GPUS)
+// writes "--gres=gpu:1", which CPU-only sites refuse. Only sbatch's own stderr
+// is inspected — the error message also echoes the whole script, which
+// contains "--gres" whenever GPUs were requested.
+function gresHint(err) {
+  const stderr = String(err?.stderr ?? '');
+  return /gres|GPU|Invalid generic resource/i.test(stderr)
+    ? '\n💡 This site may not offer GPUs: set SLURM_DEFAULT_GPUS=0 or pass gpus:0.'
+    : '';
 }
 
 server.tool('slurm_submit',
@@ -1598,7 +1768,7 @@ server.tool('slurm_submit',
 
   const lines = [
     '#!/bin/bash',
-    `#SBATCH --account=${SLURM_ACCOUNT}`,
+    ...(SLURM_ACCOUNT ? [`#SBATCH --account=${SLURM_ACCOUNT}`] : []),
     `#SBATCH --partition=${args.partition}`,
     `#SBATCH --job-name=${args.job_name}`,
     `#SBATCH --time=${args.time}`,
@@ -1655,7 +1825,7 @@ server.tool('slurm_submit',
     }
     return { content: [{ type: 'text', text: out + limitHints + resourceInfo + workdirHint }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `Submit failed: ${String(e?.message ?? e)}${limitHints}` }], isError: true };
+    return { content: [{ type: 'text', text: `Submit failed: ${String(e?.message ?? e)}${gresHint(e)}${limitHints}` }], isError: true };
   }
 });
 
@@ -1691,7 +1861,10 @@ server.tool('slurm_logs', 'Read SLURM job output log. For array jobs pass one ta
     let stdoutPath = usable(sacctPath) ? sacctPath : '';
     if (!stdoutPath) {
       try {
-        const p = sshExec(`scontrol show job '${jid}' 2>/dev/null | grep -o 'StdOut=[^ ]*' | cut -d= -f2`, 10000).trim();
+        // An array base id prints one record (one StdOut=) per task: use the
+        // first; a multi-line value would otherwise trip UNSAFE_PATH ("\n").
+        const p = (sshExec(`scontrol show job '${jid}' 2>/dev/null | grep -o 'StdOut=[^ ]*' | cut -d= -f2`, 10000)
+          .split('\n').map(l => l.trim()).find(Boolean)) || '';
         if (usable(p)) stdoutPath = p; // scontrol expands the placeholders
       } catch { /* job no longer known to slurmctld */ }
     }
@@ -1781,7 +1954,7 @@ server.tool('slurm_submit_file', 'Submit an existing .slurm/.sh script file on H
     }
     return { content: [{ type: 'text', text: out }] };
   } catch (e) {
-    return { content: [{ type: 'text', text: `Submit failed: ${String(e?.message ?? e)}` }], isError: true };
+    return { content: [{ type: 'text', text: `Submit failed: ${String(e?.message ?? e)}${gresHint(e)}` }], isError: true };
   }
 });
 
@@ -1789,7 +1962,7 @@ server.tool('cluster_info', 'Get HPC cluster partitions, queue load, your jobs, 
   try {
     const host = sshExec('hostname', 10000);
     const partitions = sshExec('sinfo -s', 15000);
-    const jobs = sshExec(`squeue -u ${SSH_USER}`, 15000);
+    const jobs = sshExec(`squeue -u ${shq(SSH_USER)}`, 15000);
     const out = [
       '=== Host ===',
       host || '(unknown)',
@@ -1893,12 +2066,12 @@ function summarizeResourceReport(raw) {
 }
 
 server.tool('resource_report', 'Summarize resource usage over a time period', {
-  days: z.number().optional().default(7).describe('Number of days to look back (default 7)'),
+  days: z.number().min(0).max(3650).optional().default(7).describe('Number of days to look back (default 7)'),
   format: z.enum(['text', 'csv']).optional().default('text'),
 }, async (args) => {
   try {
     const raw = sshExec(
-      `sacct -u ${SSH_USER} --format=JobID%-20,JobName%-30,Partition,Elapsed,MaxRSS,ReqMem,ReqTRES,State -P -S $(date -d '${args.days} days ago' +%Y-%m-%d) -n`,
+      `sacct -u ${shq(SSH_USER)} --format=JobID%-20,JobName%-30,Partition,Elapsed,MaxRSS,ReqMem,ReqTRES,State -P -S ${sacctSinceDate(args.days)} -n`,
       20000
     );
     if (!raw) return { content: [{ type: 'text', text: 'No jobs found in the specified period.' }] };
@@ -1956,10 +2129,11 @@ server.tool('sync_files', 'Sync files between local and HPC via rsync', {
   // BatchMode for the ssh rsync spawns: same no-interactive-auth rule as sshExec.
   const rsyncArgs = ['-avz', '--partial', '-e', `ssh ${sshBaseArgs().join(' ')}`];
   if (args.delete) rsyncArgs.push('--delete');
+  // "--" ends option parsing: a path can never be read as an rsync option.
   if (args.direction === 'upload') {
-    rsyncArgs.push(args.local_path, `${SSH_HOST}:${args.remote_path}`);
+    rsyncArgs.push('--', args.local_path, `${SSH_HOST}:${args.remote_path}`);
   } else {
-    rsyncArgs.push(`${SSH_HOST}:${args.remote_path}`, args.local_path);
+    rsyncArgs.push('--', `${SSH_HOST}:${args.remote_path}`, args.local_path);
   }
   try {
     const out = execFileSync('rsync', rsyncArgs, {
@@ -1978,6 +2152,23 @@ const SAFE_SESSION = /^[a-zA-Z0-9_-]+$/;
 function validateSession(s) {
   if (!SAFE_SESSION.test(s)) throw new Error(`Invalid session name: ${s} (only a-z, 0-9, _, - allowed)`);
   return s;
+}
+
+// tmux key names that terminal_send forwards as keys (not literal text).
+// "Ctrl-C" style is accepted as an alias of tmux's "C-c".
+const TMUX_KEY_RE = /^(Enter|Tab|BTab|Escape|Space|BSpace|Up|Down|Left|Right|Home|End|PageUp|PageDown|PPage|NPage|Insert|IC|Delete|DC|F([1-9]|1[0-2])|[CMS]-.)$/;
+function tmuxKeyName(keys) {
+  const alias = String(keys).match(/^Ctrl-(.)$/i);
+  if (alias) return `C-${alias[1].toLowerCase()}`;
+  return TMUX_KEY_RE.test(keys) ? keys : null;
+}
+
+// Arguments for `tmux send-keys` into session `s`. Text is sent with
+// `-l --`: literal (no key-name lookup, so "Enter" inside a command is typed,
+// not pressed) and never parsed as a send-keys option even when it starts
+// with "-" (tmux ≥ 1.x accepts "--"; verified on tmux 3.7c).
+function sendKeysArgs(s, text, { key = false } = {}) {
+  return key ? ['send-keys', '-t', s, '--', text] : ['send-keys', '-t', s, '-l', '--', text];
 }
 
 function tmuxExec(tmuxArgs, timeout = 5000) {
@@ -2018,7 +2209,7 @@ server.tool('terminal_read', 'Read tmux terminal content', {
 
 server.tool('terminal_send', 'Send keys to tmux session. No heredoc or multi-line scripts.', {
   session: z.string().optional().default('hpc'),
-  keys: z.string().describe('Keys to send (text or special: Enter, Ctrl-C, Tab). No heredoc (<<), no multi-line code.'),
+  keys: z.string().describe('Text (typed literally) or one special key: Enter, Tab, Escape, C-c / Ctrl-C, Up, ... No heredoc (<<), no multi-line code.'),
 }, async (args) => {
   if (HEREDOC_RE.test(args.keys)) {
     return { content: [{ type: 'text', text: 'BLOCKED: heredoc not allowed via terminal_send. Write local file → sync_files upload.' }], isError: true };
@@ -2028,7 +2219,8 @@ server.tool('terminal_send', 'Send keys to tmux session. No heredoc or multi-lin
   }
   try {
     const s = validateSession(args.session);
-    tmuxExec(['send-keys', '-t', s, args.keys]);
+    const key = tmuxKeyName(args.keys);
+    tmuxExec(key ? sendKeysArgs(s, key, { key: true }) : sendKeysArgs(s, args.keys));
     await new Promise(r => setTimeout(r, 200));
     const out = tmuxExec(['capture-pane', '-t', s, '-p', '-S', '-100']);
     return { content: [{ type: 'text', text: out || '(empty)' }] };
@@ -2044,7 +2236,8 @@ server.tool('terminal_exec', 'Run an INTERACTIVE command in tmux and return outp
 }, async (args) => {
   try {
     const s = validateSession(args.session);
-    tmuxExec(['send-keys', '-t', s, args.command, 'Enter']);
+    tmuxExec(sendKeysArgs(s, args.command));
+    tmuxExec(sendKeysArgs(s, 'Enter', { key: true }));
     const wait = Math.min(args.wait ?? 1000, 30000); // cap at 30s
     await new Promise(r => setTimeout(r, wait));
     const out = tmuxExec(['capture-pane', '-t', s, '-p', '-S', '-100']);
@@ -2077,7 +2270,9 @@ server.tool('ssh_interactive', 'Start an interactive SSH session to HPC via tmux
 
     // Start tmux with SSH
     // SSH_HOST is from env var; validate to prevent injection if ever tainted
-    const safeHost = SSH_HOST.replace(/[^a-zA-Z0-9._-]/g, '');
+    // "@" is kept: HPC_HOST may be "user@host". A leading "-" is stripped (it
+    // is rejected at startup anyway) so it can never become an ssh option.
+    const safeHost = SSH_HOST.replace(/[^a-zA-Z0-9._@-]/g, '').replace(/^-+/, '');
     tmuxExec(['new-session', '-d', '-s', s, `ssh ${safeHost}`]);
 
     // Wait for SSH to connect
@@ -2086,7 +2281,8 @@ server.tool('ssh_interactive', 'Start an interactive SSH session to HPC via tmux
     // Run command if provided
     if (args.command) {
       await new Promise(r => setTimeout(r, 1000));
-      tmuxExec(['send-keys', '-t', s, args.command, 'Enter']);
+      tmuxExec(sendKeysArgs(s, args.command));
+      tmuxExec(sendKeysArgs(s, 'Enter', { key: true }));
       await new Promise(r => setTimeout(r, 1500));
     }
 
@@ -2189,7 +2385,7 @@ if (process.env.SLURM_MCP_NO_START !== '1') {
   // Claude session exits (2026-07-02: 28 zombie servers from 3 weeks found).
   function shutdown() {
     // Remove our heartbeat so other pollers can adopt our watches immediately.
-    try { unlinkSync(join(HEARTBEAT_DIR, `${windowTty}.json`)); } catch {}
+    removeOwnHeartbeat();
     process.exit(0);
   }
   process.stdin.on('end', () => { logDebug('stdin closed, exiting.'); shutdown(); });
@@ -2209,4 +2405,7 @@ export {
   atomicWriteJson, readJsonOrQuarantine, withFileLock, reclaimStaleLock,
   aggregateSacctRows, isWatchExpired, isValidWatch, parseMemToMB, summarizeResourceReport,
   expandLogPattern, safePoll, pollState,
+  RE_HOST, RE_USER, RE_ENV_TOKEN, shq, sacctSinceDate, isLockStale, readLockOwner,
+  writeHeartbeat, removeOwnHeartbeat, HEARTBEAT_DIR, tmuxKeyName, sendKeysArgs, gresHint,
+  noteHostFailure, noteHostSuccess, hostPollDue, currentPollDelay,
 };

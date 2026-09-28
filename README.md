@@ -21,18 +21,24 @@ A zero-dependency MCP server for SLURM HPC clusters. Single file, `npx`-ready.
 ### 1. Set environment variables
 
 ```bash
-export HPC_HOST=your-cluster        # SSH host alias or hostname
-export HPC_USER=your-username       # Your cluster username
-export SLURM_ACCOUNT=your-account   # SLURM account/allocation
+export HPC_HOST=your-cluster        # SSH host alias or hostname (user@host also works)
+export HPC_USER=your-username       # Your cluster username (used for squeue/sacct -u)
 # Optional:
+export SLURM_ACCOUNT=your-account   # SLURM account; unset = no #SBATCH --account (site default)
 export HPC_PREAMBLE='module load python/3.11\nconda activate myenv'
 export SLURM_DEFAULT_PARTITION=batch  # default partition for slurm_submit
 export SLURM_DEFAULT_GPUS=1           # sites without GPUs: set SLURM_DEFAULT_GPUS=0
 ```
 
-`HPC_HOST`, `HPC_USER` and `SLURM_ACCOUNT` may only contain letters, digits,
-`_`, `.` and `-` (comma-separated for multiple clusters); the server exits at
-startup with an error otherwise.
+Values are validated at startup (the server exits with an error otherwise);
+none may start with `-`, and comma-separated lists configure multiple clusters:
+
+- `HPC_HOST`: letters, digits, `_ . -`, optionally `user@host`
+- `HPC_USER`: letters, digits, `_ . - @ \` (AD/LDAP/Kerberos names such as
+  `u@ad.example.edu` or `DOMAIN\u`; always single-quoted in remote commands)
+- `SLURM_ACCOUNT`: letters, digits, `_ . -`; an empty list entry means "no
+  account" for that cluster (`acct1,,acct3`)
+- `SLURM_DEFAULT_PARTITION`: letters, digits, `_ . -` (e.g. `gpu.a100`)
 
 ### 2. Add to your MCP client
 
@@ -107,17 +113,17 @@ Add to `.cursor/mcp.json` in your project root:
 
 This is a standard MCP server using stdio transport. Configure it in your client with:
 - **Command**: `npx -y slurm-mcp-server`
-- **Environment variables**: `HPC_HOST`, `HPC_USER`, `SLURM_ACCOUNT` (required), `HPC_PREAMBLE`, `NOTIFY_WEBHOOK`, `HPC_RESOURCE_LOG`, `HPC_GUIDE_EXTRA`, `SLURM_DEFAULT_PARTITION`, `SLURM_DEFAULT_GPUS` (optional)
+- **Environment variables**: `HPC_HOST`, `HPC_USER` (required), `SLURM_ACCOUNT`, `HPC_PREAMBLE`, `NOTIFY_WEBHOOK`, `HPC_RESOURCE_LOG`, `HPC_GUIDE_EXTRA`, `SLURM_DEFAULT_PARTITION`, `SLURM_DEFAULT_GPUS`, `HPC_REQUIRE_MASTER` (optional)
 </details>
 
 ### 3. Restart your client
 
-That's it. SSH ControlMaster is recommended for persistent connections.
+That's it. See [SSH Setup](#ssh-setup) for the two connection modes (ControlMaster, required on MFA clusters, or direct BatchMode connections).
 
 ## Features
 
 ### 🖥️ TTY-Aware Job Watching
-Each terminal window tracks its own SLURM jobs independently. No cross-talk between windows. Automatic 30-second polling (one batched `sacct` per cluster) with state change detection. A watch stays alive as long as `sacct` still reports the job (long queue waits included); it only expires after max(48h, 4 × the time limit) without being seen. Watches are keyed by cluster + job id, so the same id on two clusters never collides. Array jobs are tracked per task and reported once all tasks reach a terminal state (`CANCELLED by <uid>`, `PREEMPTED`, `BOOT_FAIL`, `DEADLINE`, `REVOKED` included). Watch/notification/template state files are written atomically under a lock file, and a corrupt file is moved aside as `.corrupt-<ts>` instead of being overwritten.
+Each terminal window tracks its own SLURM jobs independently. No cross-talk between windows. Automatic 30-second polling (one batched `sacct` per cluster) with state change detection. A watch only expires after successful `sacct` queries of its cluster have not reported the job for max(48h, 4 × the time limit); long queue waits and master outages (no successful query) never expire it. Watches are keyed by cluster + job id, so the same id on two clusters never collides. Array jobs are tracked per task and reported once all tasks reach a terminal state (`CANCELLED by <uid>`, `PREEMPTED`, `BOOT_FAIL`, `DEADLINE`, `REVOKED` included). Watch/notification/template state files are written atomically under a lock file, and a corrupt file is moved aside as `.corrupt-<ts>` instead of being overwritten.
 
 ### 👪 Orphan Watch Adoption
 Every server writes a heartbeat every 30s on its own timer (independent of poll backoff); when a session dies, its watches are adopted by any live instance and keep being monitored. Pending notifications from closed sessions are surfaced (and drained) by whichever session runs next — long jobs never complete silently.
@@ -145,7 +151,7 @@ Per-window working directory tracking prevents accidentally submitting jobs to w
 Configure multiple clusters with comma-separated `HPC_HOST`. Switch between them with `cluster_switch`. Each watch remembers its cluster, so jobs on multiple clusters are polled correctly at the same time. `HPC_PREAMBLE` is only injected on the primary cluster (module names differ across clusters); pass `preamble: false` on `slurm_submit` to skip it entirely.
 
 ### 🚦 MFA-Safe Connection Handling
-On clusters enforcing chained MFA (publickey **and** Duo), a background process can never re-authenticate — each blind reconnect attempt is just a failed login that feeds the bastion's fail2ban. This server therefore never kills or rebuilds your SSH ControlMaster. Every ssh/rsync call runs with `BatchMode=yes`, so nothing ever falls back to an interactive prompt. It probes the master socket locally (`ssh -O check`, zero network) before any traffic; if the master is dead it fails fast with instructions to reconnect interactively, and polling pauses with exponential backoff (30s → 10min).
+On clusters enforcing chained MFA (publickey **and** Duo), a background process can never re-authenticate — each blind reconnect attempt is just a failed login that feeds the bastion's fail2ban. This server therefore never kills or rebuilds your SSH ControlMaster. Every ssh/rsync call runs with `BatchMode=yes`, so nothing ever falls back to an interactive prompt. It probes the master socket locally (`ssh -O check`, zero network) before any traffic; if the master is dead it fails fast with instructions to reconnect interactively, and polling of that cluster pauses with exponential backoff (30s → 10min). Backoff is per cluster: a dead master on one cluster never delays notifications from another.
 
 ### 📋 Job Templates
 Save and reuse common SLURM configurations (partition, GPU count, memory, time, extra preamble lines). Apply with `template: "my-template"` on submit; an unknown template name is an error.
@@ -202,17 +208,24 @@ Start a tmux-based interactive SSH session for commands needing 2FA, confirmatio
 |----------|:---:|-------------|
 | `HPC_HOST` | ✅ | SSH host (alias from `~/.ssh/config` or hostname) |
 | `HPC_USER` | ✅ | Username on HPC cluster |
-| `SLURM_ACCOUNT` | ✅ | SLURM account for job submission |
+| `SLURM_ACCOUNT` | ❌ | SLURM account for job submission. Unset/empty: no `#SBATCH --account` line (the site's default account applies) |
 | `HPC_PREAMBLE` | ❌ | Shell commands to run before job scripts (module loads, conda activate, etc.) — newline-separated |
 | `NOTIFY_WEBHOOK` | ❌ | Slack/Discord webhook URL for job completion alerts |
 | `HPC_RESOURCE_LOG` | ❌ | Path **on the cluster** to an extra resource log (e.g. TSV of past runs) that `resource_check` greps by job name |
 | `HPC_GUIDE_EXTRA` | ❌ | Local path to a site-specific guide appended to the `guide` tool output (accounts, partition policy, envs) |
 | `SLURM_DEFAULT_PARTITION` | ❌ | Default `partition` for `slurm_submit` (default `batch`) |
 | `SLURM_DEFAULT_GPUS` | ❌ | Default `gpus` for `slurm_submit` (default `1`). Sites without GPUs: set `SLURM_DEFAULT_GPUS=0` (no `--gres` line) |
+| `HPC_REQUIRE_MASTER` | ❌ | `1` = require a ControlMaster: a host without `ControlPath` is treated like a dead master (fail fast, no direct connection). Recommended on MFA clusters |
 
 ## SSH Setup
 
-This server requires an active SSH connection. Recommended `~/.ssh/config`:
+Every ssh/rsync call runs with `BatchMode=yes` (never an interactive prompt).
+Before connecting, the server runs `ssh -O check <host>` locally and picks one
+of two modes:
+
+**1. ControlMaster (required for MFA clusters, e.g. publickey + Duo).** A
+background process can never answer an MFA prompt, so all traffic must reuse a
+master connection you opened interactively. `~/.ssh/config`:
 
 ```
 Host mycluster
@@ -223,13 +236,26 @@ Host mycluster
     ControlPersist 12h
 ```
 
-Create the socket directory: `mkdir -p ~/.ssh/sockets`
+Create the socket directory (`mkdir -p ~/.ssh/sockets`) and run `ssh mycluster`
+once in a terminal. If the master dies, tools fail fast with a "reconnect
+interactively" message and polling of that cluster pauses — nothing ever
+retries a login in the background. Set `HPC_REQUIRE_MASTER=1` so that a
+missing `ControlPath` is also treated as "dead" instead of falling back to
+mode 2.
+
+**2. Direct connections (no ControlPath configured, no MFA).** When `ssh -O
+check` answers "No ControlPath specified", every call connects directly with
+`ssh -o BatchMode=yes` — this works with key-based login without MFA (an
+agent or unencrypted key). `ssh_status` reports "ControlMaster not configured —
+direct BatchMode connections". Each call is a new login, so on clusters with
+fail2ban prefer mode 1.
 
 ## Known limitations
 
 - **Synchronous ssh calls block the event loop.** Tool handlers use `execFileSync`, so while one remote command runs (up to its timeout, max 10 min for `ssh_exec`), the server handles no other request and the poller waits. Moving to async execution is planned.
 - **Windows clients are not supported.** Local paths (`sync_files`, state files under `~/.claude`), the tty detection and the ControlMaster checks assume a POSIX client (macOS / Linux).
 - **The Command Guard is not a security boundary.** It only catches quoting mistakes that break the `bash --login -c '...'` transport; `ssh_exec` runs arbitrary commands as your cluster user.
+- **GPU default.** `SLURM_DEFAULT_GPUS` defaults to `1` for backward compatibility, so on a CPU-only site every `slurm_submit` without `gpus` writes `--gres=gpu:1` and sbatch rejects it; the error then suggests `SLURM_DEFAULT_GPUS=0` / `gpus: 0`. Set `SLURM_DEFAULT_GPUS=0` on such sites.
 - **Association-level QoS limits are not shown.** `cluster_info` and the submit hints read partition `MaxTime` and the partition QoS (`sacctmgr show qos`); limits set on your user/account association are not queried.
 
 ## License

@@ -4,8 +4,13 @@
 // command with output copied from a real SLURM cluster.
 //
 // Scenarios ($FAKE_SCENARIO): normal (default) | array | cancelled_by |
-// master_dead | sbatch_fail.
+// master_dead | master_unconfigured | sbatch_fail.
 // Extra knobs (env, all optional):
+//   FAKE_SCENARIO_BY_HOST=hostA:master_dead,hostB:normal  per-host scenario
+//                               (overrides FAKE_SCENARIO for those hosts)
+//   FAKE_SBATCH_ERR=gres        sbatch_fail reports a GPU/gres error instead
+//                               of an account error
+//   FAKE_SACCT_MISSING=id,id    the poll sacct does not report these job ids
 //   FAKE_DEAD_HOSTS=a,b         `ssh -O check <host>` fails for these hosts
 //   FAKE_RESOURCE_HISTORY=rows|fail   resource-history sacct queries return
 //                               real-shaped rows (MaxRSS only on step rows) or fail
@@ -21,7 +26,11 @@
 const { appendFileSync, existsSync, readFileSync, writeFileSync } = require('node:fs');
 
 const argv = process.argv.slice(2);
-const scenario = process.env.FAKE_SCENARIO || 'normal';
+// Host: `ssh -O check <host>` or `ssh [opts] <host> <command>`.
+const oi = argv.indexOf('-O');
+const host = oi >= 0 ? argv[oi + 2] : argv[argv.length - 2];
+const byHost = Object.fromEntries((process.env.FAKE_SCENARIO_BY_HOST || '').split(',').filter(Boolean).map(kv => kv.split(':')));
+const scenario = byHost[host] || process.env.FAKE_SCENARIO || 'normal';
 const LOG = process.env.FAKE_LOG;
 
 function readStdin() {
@@ -37,14 +46,16 @@ function out(text, code = 0, err = '') {
 }
 
 // --- Control-master probe: ssh -O check <host> ---
-const oi = argv.indexOf('-O');
 if (oi >= 0) {
   const op = argv[oi + 1];
   log({ kind: 'control', op });
-  const host = argv[oi + 2];
   const dead = (process.env.FAKE_DEAD_HOSTS || '').split(',').filter(Boolean);
   if (scenario === 'master_dead' || dead.includes(host)) {
     out('', 255, 'Control socket connect(/tmp/cm-fake): No such file or directory');
+  }
+  if (scenario === 'master_unconfigured') {
+    // Real OpenSSH message when no ControlPath is configured for the host.
+    out('', 255, 'No ControlPath specified for "-O" command');
   }
   out('', 0, 'Master running (pid=1)');
 }
@@ -70,7 +81,9 @@ const JOB_IDS = { normal: '541806', array: '541822', cancelled_by: '541900' };
 
 function sacctPollRows(ids) {
   const rows = [];
+  const missing = (process.env.FAKE_SACCT_MISSING || '').split(',').filter(Boolean);
   for (const id of ids) {
+    if (missing.includes(id)) continue;
     if (scenario === 'array' && id === '541822') {
       let calls = 0;
       if (stateFile && existsSync(stateFile)) calls = +readFileSync(stateFile, 'utf8') || 0;
@@ -99,6 +112,7 @@ const QOS = { shortqos: { Name: 'shortqos', MaxJobsPU: '1', MaxSubmitPU: '', Max
 let r;
 if (/\|\s*sbatch\b/.test(cmd) || /^sbatch\s/.test(cmd)) {
   if (scenario === 'sbatch_fail') {
+    if (process.env.FAKE_SBATCH_ERR === 'gres') out('', 1, 'sbatch: error: Invalid generic resource (gres) specification');
     out('', 1, 'sbatch: error: Batch job submission failed: Invalid account or account/partition combination specified');
   }
   out(`Submitted batch job ${JOB_IDS[scenario] || '541806'}`);
@@ -110,10 +124,10 @@ if (/\|\s*sbatch\b/.test(cmd) || /^sbatch\s/.test(cmd)) {
   if (rh === 'fail') out('', 1, 'sacct: error: Problem talking to the database: Connection refused');
   if (rh === 'rows') {
     out(['541700|other|COMPLETED', '541806|train|COMPLETED', '541807|Train-big|COMPLETED',
-      '541808|train|FAILED', '541809_1|train|COMPLETED'].join('\n'));
+      '541808|train|FAILED', '541809_1|train|COMPLETED', '541810+0|train-het|COMPLETED'].join('\n'));
   }
   out('');
-} else if ((r = cmd.match(/^sacct -j ([\d_,]+) -o JobID%-20,JobName%-20,Elapsed,MaxRSS,ReqMem,State -P -n$/))) {
+} else if ((r = cmd.match(/^sacct -j ([\d_+,]+) -o JobID%-20,JobName%-20,Elapsed,MaxRSS,ReqMem,State -P -n$/))) {
   // resource history step 2: every row incl. steps. As on the real cluster,
   // the allocation row has an empty MaxRSS; only steps carry it.
   if (process.env.FAKE_RESOURCE_HISTORY === 'fail') out('', 1, 'sacct: error: Problem talking to the database: Connection refused');
@@ -121,6 +135,7 @@ if (/\|\s*sbatch\b/.test(cmd) || /^sbatch\s/.test(cmd)) {
     541806: ['541806|train|00:10:00||4G|COMPLETED', '541806.batch|batch|00:10:00|1.50G||COMPLETED', '541806.extern|extern|00:10:00|1024K||COMPLETED'],
     541807: ['541807|Train-big|01:00:00||8G|COMPLETED', '541807.batch|batch|01:00:00|3G||COMPLETED', '541807.extern|extern|01:00:00|0||COMPLETED'],
     '541809_1': ['541809_1|train|00:05:00||4G|COMPLETED', '541809_1.batch|batch|00:05:00|512M||COMPLETED'],
+    '541810+0': ['541810+0|train-het|00:02:00||4G|COMPLETED', '541810+0.batch|batch|00:02:00|256M||COMPLETED'],
   };
   out(r[1].split(',').flatMap(id => rows[id] || []).join('\n'));
 } else if ((r = cmd.match(/^sacct -j '([^']+)' --format=StdOut/))) {

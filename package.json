@@ -31,7 +31,7 @@
     "url": "git+https://github.com/Charlie-Z-work/slurm-mcp-server.git"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^3.24.4"
   },
   "engines": {

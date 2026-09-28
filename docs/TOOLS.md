@@ -3,7 +3,7 @@
 ## SSH Tools
 
 ### ssh_status
-Check if SSH connection to HPC is active.
+Check if SSH connection to HPC is active. Reports one of: the live ControlMaster; "ControlMaster not configured — direct BatchMode connections" (no `ControlPath` for the host; tools connect directly, see README → SSH Setup); or "SSH not connected" (dead master, or no ControlPath with `HPC_REQUIRE_MASTER=1`).
 
 **Parameters:** None
 
@@ -89,8 +89,8 @@ Submit a SLURM batch job with automatic resource checking.
 |------|------|:---:|---------|-------------|
 | script | string | ✅ | — | Main command(s) to run |
 | job_name | string | ❌ | slurm-job | Job name, `[A-Za-z0-9_.-]{1,64}` |
-| partition | string | ❌ | `SLURM_DEFAULT_PARTITION` or batch | SLURM partition (`[A-Za-z0-9_-]+`). See `cluster_info` for per-user caps |
-| gpus | number | ❌ | `SLURM_DEFAULT_GPUS` or 1 | Number of GPUs (non-negative integer; 0 = no `--gres` line; some sites reject 0) |
+| partition | string | ❌ | `SLURM_DEFAULT_PARTITION` or batch | SLURM partition (`[A-Za-z0-9_.-]+`, e.g. `gpu.a100`, no leading `-`). See `cluster_info` for per-user caps |
+| gpus | number | ❌ | `SLURM_DEFAULT_GPUS` or 1 | Number of GPUs (non-negative integer; 0 = no `--gres` line; some sites reject 0). If sbatch rejects the GPU request, the error suggests `SLURM_DEFAULT_GPUS=0` / `gpus: 0` |
 | mem | string | ❌ | 4G | Memory, `^\d+[KMGT]?$` |
 | time | string | ❌ | 00:15:00 | Time limit: `M`, `M:S`, `H:M:S`, `D-H`, `D-H:M`, `D-H:M:S` (surrounding whitespace is trimmed) |
 | cpus_per_task | number | ❌ | — | CPUs per task (non-negative integer) |
@@ -102,6 +102,7 @@ Submit a SLURM batch job with automatic resource checking.
 
 **Features:**
 - Every parameter is validated against a whitelist; invalid input returns an error instead of a broken script
+- `#SBATCH --account` is written only when `SLURM_ACCOUNT` is set (for the active cluster)
 - Auto-checks resource history before submitting
 - Workdir guard prevents wrong-directory submissions
 - Logs go to `slurm_%j.out`, or `slurm_%A_%a.out` for arrays
@@ -196,7 +197,7 @@ Switch the active cluster (multi-cluster `HPC_HOST`). Omit `host` to list cluste
 ## File Tools
 
 ### sync_files
-Sync files between local and HPC via rsync.
+Sync files between local and HPC via rsync (`rsync -avz --partial -e "ssh -o BatchMode=yes" -- <src> <dst>`; `--` stops option parsing, so a path can never become an rsync option).
 
 **Parameters:**
 | Name | Type | Required | Default | Description |
@@ -282,7 +283,7 @@ Send keys to tmux session.
 | Name | Type | Required | Default | Description |
 |------|------|:---:|---------|-------------|
 | session | string | ❌ | hpc | Session name |
-| keys | string | ✅ | — | Keys to send (text or special: Enter, Ctrl-C, Tab). Max 500 chars. |
+| keys | string | ✅ | — | Text, typed literally (`send-keys -l --`, so a leading `-` or the word "Enter" inside it is just text), or exactly one special key: `Enter`, `Tab`, `Escape`, `C-c` (alias `Ctrl-C`), `Up`, … Max 500 chars. |
 
 ---
 

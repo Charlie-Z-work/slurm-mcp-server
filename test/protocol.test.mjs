@@ -318,7 +318,9 @@ describe('normal scenario', async () => {
     const r = await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x', remote_path: '~/x' });
     assert.equal(r.isError, false, r.text);
     const rs = s.logEntries().filter(e => e.kind === 'rsync').at(-1);
-    assert.deepEqual(rs.argv, ['-avz', '--partial', '-e', 'ssh -o BatchMode=yes', '/tmp/x', 'fake:~/x']);
+    assert.deepEqual(rs.argv, ['-avz', '--partial', '-e', 'ssh -o BatchMode=yes', '--', '/tmp/x', 'fake:~/x']);
+    await s.call('sync_files', { direction: 'download', local_path: '/tmp/y', remote_path: '-evil' });
+    assert.deepEqual(s.logEntries().filter(e => e.kind === 'rsync').at(-1).argv.slice(-3), ['--', 'fake:-evil', '/tmp/y'], 'paths after "--" (R12)');
     assert.equal((await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x;rm', remote_path: '~' })).isError, true);
   });
   test('template_save + template_list round trip', async () => {
@@ -399,17 +401,24 @@ describe('multi-cluster watches (B1)', async () => {
 });
 
 describe('poller robustness', async () => {
-  test('watch host from the shared file never reaches a local shell (BUG-13)', async () => {
+  test('watch host from the shared file is whitelisted before any ssh (BUG-13, R8)', async () => {
     const s = await startServer();
     try {
       const tty = await s.tty();
       const marker = join(s.dir, 'pwned');
       const evilHost = `fake;touch ${marker}`;
-      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, host: evilHost, jobName: 'evil' })]));
-      const seen = await waitFor(async () => ({
-        ok: s.logEntries().some(e => e.kind === 'control' && e.argv.join(' ') === `-O check ${evilHost}`),
-      }));
-      assert.ok(seen.ok, 'masterAlive passed the host as one argv element');
+      writeFileSync(s.watchesFile, JSON.stringify([
+        seedWatch({ tty, host: evilHost, jobName: 'evil' }),
+        seedWatch({ tty, host: '-oProxyCommand=touch', jobName: 'opt' }),
+        seedWatch({ tty, jobId: 541806, jobName: 'numeric-id' }), // hand-edited: number, not string
+      ]));
+      const done = await waitFor(async () => {
+        const w = await s.call('slurm_watches');
+        return { ok: /SLURM job 541806 \(numeric-id\) COMPLETED/.test(w.text), text: w.text };
+      });
+      assert.ok(done.ok, `numeric jobId watch is polled, not dropped: ${done.text}`);
+      const hosts = s.logEntries().filter(e => e.kind === 'control').map(e => e.argv.at(-1));
+      assert.ok(hosts.length > 0 && hosts.every(h => h === 'fake'), JSON.stringify(hosts));
       assert.equal(existsSync(marker), false, 'no shell interpreted the host');
     } finally { await s.stop(); }
   });
@@ -500,12 +509,17 @@ describe('resource history (B7, B8, B9)', () => {
       assert.equal(r.isError, false, r.text);
       assert.match(r.text, /=== SLURM sacct \(last 7 days\) ===/);
       assert.match(r.text, /541806\.batch\|batch\|00:10:00\|1\.50G/);
-      assert.match(r.text, /Resource baseline \(3 recent jobs\)/);
+      assert.match(r.text, /Resource baseline \(4 recent jobs\)/);
       assert.match(r.text, /Actual peak: 3\.0G mem, 60m0s time/);
       const cmds = execs(s).map(e => e.cmd);
-      assert.ok(cmds.includes('sacct -j 541806,541807,541809_1 -o JobID%-20,JobName%-20,Elapsed,MaxRSS,ReqMem,State -P -n'), cmds.join('\n'));
+      // hetjob component ids ("541810+0") pass the step-1 filter (R10)
+      assert.ok(cmds.includes('sacct -j 541806,541807,541809_1,541810+0 -o JobID%-20,JobName%-20,Elapsed,MaxRSS,ReqMem,State -P -n'), cmds.join('\n'));
+      // start date computed locally, no GNU `date -d` on the cluster (R10)
+      const step1 = cmds.find(c => c.startsWith('sacct -u '));
+      assert.match(step1, /^sacct -u 'u' -X -S \d{4}-\d{2}-\d{2} -o /);
+      assert.doesNotMatch(cmds.join('\n'), /date -d/);
       const sub = await s.call('slurm_submit', { script: 'echo hi', job_name: 'train', mem: '200G' });
-      assert.match(sub.text, /Resource baseline \(3 recent jobs\)/);
+      assert.match(sub.text, /Resource baseline \(4 recent jobs\)/);
       assert.match(sub.text, /Memory 200G is 67x actual usage \(3\.0G\)/);
     } finally { await s.stop(); }
   });
@@ -603,9 +617,9 @@ describe('array scenario', async () => {
       return { ok: /541822 \(arr\) \[RUNNING tasks done 1\/2\]/.test(w.text), text: w.text };
     });
     assert.ok(partial.ok, partial.text);
-    // sacct sees the job → lastSeenAt is refreshed (B5: keeps queued jobs' watches alive)
+    // sacct sees the job → no expiry clock (R4)
     const seen = s.readWatches().find(w => w.jobId === '541822');
-    assert.ok(seen.lastSeenAt && Date.now() - Date.parse(seen.lastSeenAt) < 60_000, JSON.stringify(seen));
+    assert.equal(seen.unseenSince, undefined, JSON.stringify(seen));
     // Several more polls while task 2 is still running: must not complete.
     await new Promise(res => setTimeout(res, 1000));
     const still = await s.call('slurm_watches');
@@ -728,5 +742,230 @@ describe('lifecycle', () => {
     await s.stop();
     assert.ok(s.child.exitCode === 0 || s.child.signalCode != null, `exit ${s.child.exitCode}/${s.child.signalCode}`);
     assert.equal(s.child.exitCode, 0, 'clean exit via stdin close, not SIGKILL');
+  });
+});
+
+// ---- Round-3 review fixes (R1-R13) ----
+
+describe('env whitelists accept real-world values (R1)', () => {
+  test('HPC_HOST=user@host, HPC_USER with @, SLURM_DEFAULT_PARTITION=gpu.a100', async () => {
+    const s = await startServer({ env: { HPC_HOST: 'u@fake', HPC_USER: 'u@ad.example.edu', SLURM_DEFAULT_PARTITION: 'gpu.a100', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      assert.match((await s.call('ssh_status')).text, /SSH active/);
+      assert.deepEqual(s.logEntries().filter(e => e.kind === 'control').at(-1).argv, ['-O', 'check', 'u@fake']);
+      assert.equal((await s.call('slurm_status')).isError, false);
+      assert.ok(execs(s).some(e => e.cmd === "squeue -u 'u@ad.example.edu'"), 'user single-quoted');
+      const r = await s.call('slurm_submit', { script: 'echo hi', job_name: 'p' });
+      assert.equal(r.isError, false, r.text);
+      assert.ok(submitCmd(s).includes('\n#SBATCH --partition=gpu.a100\n'));
+      assert.deepEqual(execs(s).at(-1).argv.slice(0, 3), ['-o', 'BatchMode=yes', 'u@fake']);
+    } finally { await s.stop(); }
+  });
+  test('HPC_USER with a backslash (DOMAIN\\user) survives the ssh quoting', async () => {
+    const s = await startServer({ env: { HPC_USER: 'DOMAIN\\u', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      assert.equal((await s.call('slurm_status')).isError, false);
+      assert.ok(execs(s).some(e => e.cmd === "squeue -u 'DOMAIN\\u'"), JSON.stringify(execs(s).map(e => e.cmd)));
+    } finally { await s.stop(); }
+  });
+  const bad = [
+    [{ HPC_HOST: '-oProxyCommand=x' }, /HPC_HOST contains an invalid entry "-oProxyCommand=x"/],
+    [{ HPC_HOST: '-oProxyCommand' }, /HPC_HOST contains an invalid entry/],
+    [{ HPC_HOST: 'u@-oX' }, /HPC_HOST contains an invalid entry/],
+    [{ HPC_USER: '-oProxyCommand=x' }, /HPC_USER contains an invalid entry/],
+    [{ HPC_USER: "u'x" }, /HPC_USER contains an invalid entry/],
+    [{ SLURM_DEFAULT_PARTITION: '-p' }, /SLURM_DEFAULT_PARTITION "-p" must match/],
+    [{ SLURM_ACCOUNT: '-A' }, /SLURM_ACCOUNT contains an invalid entry/],
+  ];
+  for (const [env, re] of bad) {
+    test(`exits 1 on ${JSON.stringify(env)}`, async () => {
+      const { code, stderr } = await runExpectingExit(env);
+      assert.equal(code, 1);
+      assert.match(stderr, re);
+    });
+  }
+});
+
+describe('master_unconfigured scenario (R2)', async () => {
+  const s = await startServer({ scenario: 'master_unconfigured' });
+  after(() => s.stop());
+  test('ssh_status explains the direct BatchMode mode', async () => {
+    const r = await s.call('ssh_status');
+    assert.equal(r.isError, false);
+    assert.match(r.text, /ControlMaster not configured — direct BatchMode connections.*configure ControlMaster \(see README\)/);
+  });
+  test('tools connect directly with BatchMode instead of reporting a dead master', async () => {
+    const r = await s.call('ssh_exec', { command: 'ls /home/u' });
+    assert.equal(r.isError, false, r.text);
+    assert.equal(r.text, 'a.txt\nb.txt');
+    assert.deepEqual(execs(s).at(-1).argv.slice(0, 3), ['-o', 'BatchMode=yes', 'fake']);
+  });
+  test('the poller completes watches without a ControlMaster', async () => {
+    const r0 = await s.call('slurm_submit', { script: 'echo hi', job_name: 'nocm' });
+    assert.match(r0.text, /Submitted batch job 541806/);
+    const done = await waitFor(async () => {
+      const w = await s.call('slurm_watches');
+      return { ok: /SLURM job 541806 \(nocm\) COMPLETED/.test(w.text), text: w.text };
+    });
+    assert.ok(done.ok, done.text);
+  });
+});
+
+describe('HPC_REQUIRE_MASTER=1 (R2)', async () => {
+  const s = await startServer({ scenario: 'master_unconfigured', env: { HPC_REQUIRE_MASTER: '1', SLURM_MCP_POLL_MS: '600000' } });
+  after(() => s.stop());
+  test('unconfigured is treated as dead: fail fast, no remote traffic', async () => {
+    const e = await s.call('ssh_exec', { command: 'ls' });
+    assert.equal(e.isError, true);
+    assert.match(e.text, /SSH master connection to fake is dead/);
+    assert.match((await s.call('ssh_status')).text, /SSH not connected \(HPC_REQUIRE_MASTER=1 and no ControlPath/);
+    assert.ok(s.logEntries().every(x => x.kind === 'control'));
+  });
+});
+
+describe('watch expiry only counts successful polls (R4)', () => {
+  test('master dead: a watch older than the TTL is kept (not expired)', async () => {
+    const s = await startServer({ scenario: 'master_dead' });
+    try {
+      const tty = await s.tty();
+      const old = new Date(Date.now() - 30 * 24 * 3600_000).toISOString();
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'outage', submittedAt: old, lastSeenAt: old })]));
+      const r = await waitFor(async () => {
+        const w = await s.call('slurm_watches');
+        return { ok: /Last poll error: SSH master to fake is dead/.test(w.text), text: w.text };
+      });
+      assert.ok(r.ok, r.text);
+      assert.match(r.text, /541806 \(outage\) \[PENDING\]/, 'watch still listed');
+      assert.equal(s.readWatches()[0].unseenSince, undefined, 'a failed poll never starts the expiry clock');
+    } finally { await s.stop(); }
+  });
+  test('sacct answers without the job: unseenSince is set once; seen again → cleared', async () => {
+    const s0 = mkdtempSync(join(tmpdir(), 'slurm-mcp-miss-'));
+    const s = await startServer({ env: { FAKE_SACCT_MISSING: '541806' } });
+    try {
+      const tty = await s.tty();
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'missing' })]));
+      const r = await waitFor(async () => ({ ok: !!s.readWatches()[0]?.unseenSince }));
+      assert.ok(r.ok, JSON.stringify(s.readWatches()));
+      const first = s.readWatches()[0].unseenSince;
+      await new Promise(res => setTimeout(res, 700));
+      assert.equal(s.readWatches()[0].unseenSince, first, 'not reset by later polls');
+      // An entry whose unseenSince is older than the TTL is expired.
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'gone', unseenSince: new Date(Date.now() - 49 * 3600_000).toISOString() })]));
+      assert.match((await s.call('slurm_watches')).text, /\(no watches for this window\)/);
+    } finally { await s.stop(); rmSync(s0, { recursive: true, force: true }); }
+  });
+});
+
+describe('per-host backoff (R6)', () => {
+  test('a dead cluster does not delay notifications of a healthy one', async () => {
+    const s = await startServer({ env: { HPC_HOST: 'hostA,hostB', FAKE_SCENARIO_BY_HOST: 'hostA:master_dead,hostB:normal' } });
+    try {
+      const tty = await s.tty();
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, host: 'hostA', jobId: '541807', jobName: 'on-dead' })]));
+      // Let hostA fail repeatedly until its backoff reaches 4s (250ms base).
+      const backed = await waitFor(async () => {
+        const w = await s.call('slurm_watches');
+        return { ok: /hostA is dead.*backoff [4-9]s/.test(w.text), text: w.text };
+      }, { timeout: 15_000 });
+      assert.ok(backed.ok, backed.text);
+      const watches = s.readWatches();
+      watches.push(seedWatch({ tty, host: 'hostB', jobName: 'on-healthy' }));
+      writeFileSync(s.watchesFile, JSON.stringify(watches));
+      const t0 = Date.now();
+      const done = await waitFor(async () => {
+        const w = await s.call('slurm_watches');
+        return { ok: /SLURM job 541806 \(on-healthy\) COMPLETED/.test(w.text), text: w.text };
+      }, { timeout: 15_000, every: 50 });
+      const latency = Date.now() - t0;
+      assert.ok(done.ok, done.text);
+      assert.ok(latency < 2000, `healthy host notified after ${latency}ms`);
+      assert.match(done.text, /541807 \(on-dead\)/, 'dead host watch kept');
+      // hostA is skipped while backing off: far fewer probes than cycles.
+      const probesA = s.logEntries().filter(e => e.kind === 'control' && e.argv.at(-1) === 'hostA').length;
+      assert.ok(probesA <= 6, `hostA probed ${probesA} times`);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('slurm_logs array ids (R7)', () => {
+  test('multi-line scontrol StdOut (array base id) uses the first path, not "Suspicious"', async () => {
+    const s = await startServer({ env: { FAKE_STDOUT: 'empty', FAKE_SCONTROL_STDOUT: '/w/logs/slurm_541822_1.out\n/w/logs/slurm_541822_2.out', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const r = await s.call('slurm_logs', { job_id: '541822', lines: 5 });
+      assert.equal(r.isError, false, r.text);
+      assert.match(r.text, /epoch 2 loss 0\.5/);
+      assert.ok(execs(s).some(e => e.cmd === "tail -n 5 '/w/logs/slurm_541822_1.out'"));
+    } finally { await s.stop(); }
+  });
+});
+
+describe('SLURM_ACCOUNT optional (R9)', () => {
+  test('unset: server starts, no #SBATCH --account line', async () => {
+    const s = await startServer({ env: { SLURM_ACCOUNT: '', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const r = await s.call('slurm_submit', { script: 'echo hi', job_name: 'noacct' });
+      assert.equal(r.isError, false, r.text);
+      assert.ok(!/--account/.test(submitCmd(s)), submitCmd(s));
+    } finally { await s.stop(); }
+  });
+  test('per-cluster list with an empty entry: no --account on that cluster', async () => {
+    const s = await startServer({ env: { HPC_HOST: 'fake,other', SLURM_ACCOUNT: 'acct,', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      await s.call('slurm_submit', { script: 'echo hi', job_name: 'a1' });
+      assert.ok(submitCmd(s).includes('\n#SBATCH --account=acct\n'));
+      await s.call('cluster_switch', { host: 'other' });
+      await s.call('slurm_submit', { script: 'echo hi', job_name: 'a2' });
+      const last = execs(s).map(e => e.cmd).filter(c => /\| sbatch/.test(c)).at(-1);
+      assert.ok(!/--account/.test(last), last);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('resource_report portability (R10)', () => {
+  test('-S date computed locally, user quoted', async () => {
+    const s = await startServer({ env: { SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      await s.call('resource_report', { days: 3 });
+      const cmd = execs(s).map(e => e.cmd).find(c => c.startsWith('sacct -u '));
+      assert.match(cmd, /^sacct -u 'u' --format=\S+ -P -S \d{4}-\d{2}-\d{2} -n$/);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('tmux tools (R12)', async () => {
+  const s = await startServer({ env: { SLURM_MCP_POLL_MS: '600000' } });
+  after(() => s.stop());
+  const tmuxCalls = () => s.logEntries().filter(e => e.kind === 'tmux').map(e => e.argv);
+  test('terminal_send: text is literal after "--", special keys are keys', async () => {
+    await s.call('terminal_send', { session: 't1', keys: '-n hi' });
+    assert.deepEqual(tmuxCalls().find(a => a[0] === 'send-keys'), ['send-keys', '-t', 't1', '-l', '--', '-n hi']);
+    await s.call('terminal_send', { session: 't1', keys: 'Ctrl-C' });
+    assert.deepEqual(tmuxCalls().filter(a => a[0] === 'send-keys').at(-1), ['send-keys', '-t', 't1', '--', 'C-c']);
+  });
+  test('terminal_exec: command literal, then Enter as a key', async () => {
+    await s.call('terminal_exec', { session: 't1', command: '-rf echo Enter', wait: 10 });
+    const sk = tmuxCalls().filter(a => a[0] === 'send-keys').slice(-2);
+    assert.deepEqual(sk, [['send-keys', '-t', 't1', '-l', '--', '-rf echo Enter'], ['send-keys', '-t', 't1', '--', 'Enter']]);
+  });
+});
+
+describe('sbatch GPU rejection hint (R13)', () => {
+  test('gres error → hint to set SLURM_DEFAULT_GPUS=0 / gpus:0', async () => {
+    const s = await startServer({ scenario: 'sbatch_fail', env: { FAKE_SBATCH_ERR: 'gres', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const r = await s.call('slurm_submit', { script: 'echo hi', job_name: 'g' });
+      assert.equal(r.isError, true);
+      assert.match(r.text, /Invalid generic resource/);
+      assert.match(r.text, /this site may not offer GPUs: set SLURM_DEFAULT_GPUS=0 or pass gpus:0/i);
+    } finally { await s.stop(); }
+  });
+  test('an unrelated sbatch error (script contains --gres) gets no GPU hint', async () => {
+    const s = await startServer({ scenario: 'sbatch_fail', env: { SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const r = await s.call('slurm_submit', { script: 'echo hi', job_name: 'a' });
+      assert.match(r.text, /Invalid account/);
+      assert.doesNotMatch(r.text, /may not offer GPUs/);
+    } finally { await s.stop(); }
   });
 });

@@ -5,7 +5,6 @@ startCommand:
     required:
       - HPC_HOST
       - HPC_USER
-      - SLURM_ACCOUNT
     properties:
       HPC_HOST:
         type: string
@@ -15,7 +14,7 @@ startCommand:
         description: Your username on the HPC cluster
       SLURM_ACCOUNT:
         type: string
-        description: SLURM account/allocation for job submission
+        description: SLURM account/allocation for job submission (optional; unset = site default account, no --account line)
       HPC_PREAMBLE:
         type: string
         description: Shell commands to run before job scripts (module loads, conda activate, etc.)
@@ -25,6 +24,9 @@ startCommand:
       SLURM_DEFAULT_GPUS:
         type: string
         description: "Default GPU count for slurm_submit (default 1). Sites without GPUs: set SLURM_DEFAULT_GPUS=0"
+      HPC_REQUIRE_MASTER:
+        type: string
+        description: "1 = require an SSH ControlMaster (MFA clusters): a host without ControlPath is treated as a dead master"
   commandFunction: |-
     (config) => ({
       command: 'npx',
@@ -32,9 +34,10 @@ startCommand:
       env: {
         HPC_HOST: config.HPC_HOST,
         HPC_USER: config.HPC_USER,
-        SLURM_ACCOUNT: config.SLURM_ACCOUNT,
+        ...(config.SLURM_ACCOUNT ? { SLURM_ACCOUNT: config.SLURM_ACCOUNT } : {}),
         ...(config.HPC_PREAMBLE ? { HPC_PREAMBLE: config.HPC_PREAMBLE } : {}),
         ...(config.SLURM_DEFAULT_PARTITION ? { SLURM_DEFAULT_PARTITION: config.SLURM_DEFAULT_PARTITION } : {}),
-        ...(config.SLURM_DEFAULT_GPUS ? { SLURM_DEFAULT_GPUS: String(config.SLURM_DEFAULT_GPUS) } : {})
+        ...(config.SLURM_DEFAULT_GPUS ? { SLURM_DEFAULT_GPUS: String(config.SLURM_DEFAULT_GPUS) } : {}),
+        ...(config.HPC_REQUIRE_MASTER ? { HPC_REQUIRE_MASTER: String(config.HPC_REQUIRE_MASTER) } : {})
       }
     })

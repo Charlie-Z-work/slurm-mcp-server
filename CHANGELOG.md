@@ -164,6 +164,54 @@ All notable changes to this project are documented here. The format follows
 - Removed unused locals (`gpuH`) and an extra tmux `capture-pane` call in
   `ssh_interactive`. `atomicWriteJson` removes its tmp file when the rename fails.
 
+### Fixed (round-4 review)
+- ControlMaster mode: every ssh call (tools, poller) and `rsync -e` also pass
+  `-o ProxyCommand=false`. If the master dies between the local `ssh -O check`
+  and the call, ssh fails locally instead of opening a new connection (a
+  publickey attempt against the bastion, fail2ban risk). The effective
+  ControlPath from the local `ssh -G <host>` is pinned with
+  `-o ControlPath=...`: a `%C` socket name hashes the ProxyJump value, so
+  overriding the proxy alone made ssh miss the live master (found in the live
+  smoke test). If the path cannot be resolved (none, or containing `%` or
+  whitespace), `ProxyCommand=false` is left out. Direct mode (no ControlPath)
+  is unchanged: `BatchMode=yes` only.
+- Long synchronous ssh/rsync calls starved the heartbeat timer; after 150s
+  other windows adopted the busy server's watches and drained its
+  notifications. Each blocking call now writes `busyUntil` (now + timeout +
+  5s) into the heartbeat, `pollerAlive` honors it, and the heartbeat is
+  refreshed when the call ends.
+- `slurm-notifications.json` entries that are not objects (e.g. `null`) are
+  ignored; draining notifications runs in its own try/catch, so it can no
+  longer turn a successful tool result (a queued sbatch) into an error.
+- Poll write-back merges into the entry on disk and only copies the fields the
+  poll owns (`state`, `progress`, `lastSeenAt`, `unseenSince`); a watch that
+  another window adopted meanwhile (different `tty`) is not written.
+- The generated job script uses `cd -- '<dir>' || exit 1`: the job never runs
+  in the wrong directory.
+- The workdir is stored per window and cluster (`byHost`): after
+  `cluster_switch`, `workdir_get` / `slurm_submit` no longer use the other
+  cluster's directory. Old files without a host belong to the first cluster.
+- Resource baseline: when no job reports MaxRSS, it says "memory: no
+  measurement available" instead of "0.0G" and gives no `--mem` advice
+  (elapsed-time advice unchanged).
+- `slurm_logs` reads StdOut from `scontrol show job -o` up to the next
+  ` Key=`, so paths containing `=` or spaces are no longer truncated.
+- `slurm_submit` rejects an `output_dir` containing `%` (sbatch expands it in
+  `--output`, but `mkdir -p` would create the literal directory).
+- `sync_files` expands a leading `~/` in `local_path` locally (rsync runs
+  without a shell; `~/x` used to be a literal `~` directory).
+- `cluster_info`: the section is titled "Per-user limits (partition QoS only;
+  association/job QoS not queried)" and a missing MaxJobsPU shows `n/a`
+  instead of `none`.
+- `slurm_status` / `slurm_cancel` / `slurm_logs` accept heterogeneous job
+  component ids (`12345+1`), like the poller.
+- Notification drain decides ownership once per entry (single pass).
+- Refactoring without behavior change: one shared watch-line formatter;
+  duplicate array-task log candidates in `slurm_logs` removed.
+- Offline tests: fake ssh answers `ssh -G` (`FAKE_CONTROLPATH`), supports
+  `FAKE_DELAY_MS` (blocking-call tests) and prints `scontrol show job -o`
+  shaped output.
+
 ## 2.2.0 - 2026-09-27
 
 ### Added

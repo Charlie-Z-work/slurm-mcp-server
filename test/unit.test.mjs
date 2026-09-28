@@ -667,3 +667,160 @@ describe('gresHint (R13)', () => {
     assert.equal(M.gresHint(new Error('x')), '');
   });
 });
+
+// ---- Round-4 review fixes (C1-C14) ----
+
+describe('sshOptsFor / parseControlPath (C1)', () => {
+  test('ControlMaster mode pins the ControlPath and adds ProxyCommand=false; direct mode does not', () => {
+    assert.deepEqual(M.sshOptsFor('alive', '/s/cm'), ['-o', 'BatchMode=yes', '-o', 'ControlPath=/s/cm', '-o', 'ProxyCommand=false']);
+    assert.deepEqual(M.sshOptsFor('unconfigured', null), ['-o', 'BatchMode=yes']);
+    assert.deepEqual(M.sshOptsFor('alive', null), ['-o', 'BatchMode=yes'], 'no pinned path → no ProxyCommand=false');
+  });
+  test('ControlPath from ssh -G output (%C-hashed path with ProxyJump)', () => {
+    const g = 'hostname superpod.example.edu\ncontrolmaster auto\ncontrolpath /Users/u/.ssh/sockets/ssh_mux_e090d0f7\nproxyjump bastion\n';
+    assert.equal(M.parseControlPath(g), '/Users/u/.ssh/sockets/ssh_mux_e090d0f7');
+    assert.equal(M.parseControlPath('controlpath none\n'), null);
+    assert.equal(M.parseControlPath('hostname x\n'), null);
+    assert.equal(M.parseControlPath('controlpath /a b/c\n'), null, 'whitespace would split rsync -e');
+    assert.equal(M.parseControlPath('controlpath /a/%h\n'), null, '% would be re-expanded');
+  });
+});
+
+describe('pollerAlive busyUntil (C2)', () => {
+  const hb = (tty, obj) => {
+    mkdirSync(M.HEARTBEAT_DIR, { recursive: true });
+    writeFileSync(join(M.HEARTBEAT_DIR, `${tty}.json`), JSON.stringify(obj));
+  };
+  test('stale heartbeat but busyUntil in the future → alive', () => {
+    const now = Date.now();
+    hb('busy-a', { pid: process.pid, at: now - 400_000, busyUntil: now + 60_000 });
+    assert.equal(M.pollerAlive('busy-a', now), true);
+  });
+  test('stale heartbeat, busyUntil passed → dead', () => {
+    const now = Date.now();
+    hb('busy-b', { pid: process.pid, at: now - 400_000, busyUntil: now - 1 });
+    assert.equal(M.pollerAlive('busy-b', now), false);
+  });
+  test('busyUntil never overrides a dead pid', () => {
+    const now = Date.now();
+    hb('busy-c', { pid: DEAD_PID, at: now - 400_000, busyUntil: now + 60_000 });
+    assert.equal(M.pollerAlive('busy-c', now), false);
+  });
+  test('withBusyHeartbeat writes busyUntil before the call and clears it after', () => {
+    const t0 = Date.now();
+    let during;
+    const files = () => readdirSync(M.HEARTBEAT_DIR).filter(f => !f.startsWith('busy-'));
+    const ret = M.withBusyHeartbeat(60_000, () => {
+      during = JSON.parse(readFileSync(join(M.HEARTBEAT_DIR, files()[0]), 'utf8'));
+      return 42;
+    });
+    assert.equal(ret, 42);
+    assert.ok(during.busyUntil >= t0 + 65_000, JSON.stringify(during));
+    const afterHb = JSON.parse(readFileSync(join(M.HEARTBEAT_DIR, files()[0]), 'utf8'));
+    assert.equal(afterHb.busyUntil, undefined);
+    assert.throws(() => M.withBusyHeartbeat(1000, () => { throw new Error('boom'); }), /boom/);
+    assert.equal(JSON.parse(readFileSync(join(M.HEARTBEAT_DIR, files()[0]), 'utf8')).busyUntil, undefined, 'cleared on throw too');
+  });
+});
+
+describe('loadNotifications / partitionNotifications (C3, C13)', () => {
+  test('non-object entries are dropped', () => {
+    mkdirSync(dirname(M.NOTIF_FILE), { recursive: true });
+    writeFileSync(M.NOTIF_FILE, JSON.stringify([null, 7, 'x', [], { tty: 't', message: 'm' }]));
+    assert.deepEqual(M.loadNotifications(), [{ tty: 't', message: 'm' }]);
+    rmSync(M.NOTIF_FILE, { force: true });
+  });
+  test('one ownership decision per entry, every entry lands in exactly one list', () => {
+    const notifs = [{ tty: 'a' }, { tty: 'b' }, { tty: 'c' }];
+    let calls = 0;
+    // A flip-flopping judge: with two passes an entry could be taken AND kept.
+    const claimable = () => (calls++ % 2 === 0);
+    const { taken, kept } = M.partitionNotifications(notifs, claimable);
+    assert.equal(calls, 3);
+    assert.equal(taken.length + kept.length, 3);
+    assert.deepEqual([...taken, ...kept].map(n => n.tty).sort(), ['a', 'b', 'c']);
+  });
+});
+
+describe('mergePolledWatch (C4)', () => {
+  const disk = { jobId: '1', host: 'h', tty: 'me', jobName: 'j', state: 'PENDING', unseenSince: 'T0', note: 'disk' };
+  test('only poll-owned fields are copied; disk is the base', () => {
+    const polled = { ...disk, state: 'RUNNING', progress: '1/2', note: 'stale', jobName: 'stale' };
+    delete polled.unseenSince;
+    const m = M.mergePolledWatch(disk, polled, 'me');
+    assert.deepEqual(m, { jobId: '1', host: 'h', tty: 'me', jobName: 'j', state: 'RUNNING', progress: '1/2', note: 'disk' });
+  });
+  test('a watch another window adopted meanwhile is left untouched', () => {
+    const adopted = { ...disk, tty: 'other' };
+    assert.equal(M.mergePolledWatch(adopted, { ...disk, state: 'RUNNING' }, 'me'), adopted);
+  });
+  test('no polled snapshot → disk entry as-is', () => assert.equal(M.mergePolledWatch(disk, undefined, 'me'), disk));
+});
+
+describe('resource baseline without MaxRSS (C7)', () => {
+  test('all MaxRSS missing: maxMemGB null, no 0.0G peak and no --mem advice; time still shown', () => {
+    const h = M.parseResourceHistory('5|t|00:10:00||4G|COMPLETED\n5.batch|batch|00:10:00|||COMPLETED');
+    assert.equal(h.maxMemGB, null);
+    assert.equal(h.maxTimeSec, 600);
+    const r = M.formatRecommendation(h);
+    assert.match(r, /memory: no measurement available/);
+    assert.match(r, /10m0s time/);
+    assert.match(r, /Recommended: --time=00:40:00 \(×4 time\)/);
+    assert.doesNotMatch(r, /0\.0G|--mem/);
+    assert.equal(M.checkResourceWaste('400G', '00:15:00', h), '');
+  });
+  test('a measured 0 is still a measurement', () => {
+    assert.equal(M.parseResourceHistory('6|t|00:01:00||4G|COMPLETED\n6.batch|batch|00:01:00|0||COMPLETED').maxMemGB, 0);
+  });
+});
+
+describe('parseScontrolStdOut (C8)', () => {
+  test('one-line records: value runs to the next " Key="', () => {
+    assert.deepEqual(M.parseScontrolStdOut('JobId=1 StdErr=/e StdIn=/dev/null StdOut=/scratch/a=b/log.out Power= TresPerNode=x'), ['/scratch/a=b/log.out']);
+    assert.deepEqual(M.parseScontrolStdOut('JobId=1 StdOut=/scratch/my logs/x.out Power='), ['/scratch/my logs/x.out']);
+    assert.deepEqual(M.parseScontrolStdOut('JobId=1 StdOut=/last/field.out'), ['/last/field.out']);
+  });
+  test('multi-line format and array records', () => {
+    assert.deepEqual(M.parseScontrolStdOut('   StdIn=/dev/null\n   StdOut=/w/a b=c.out\n   Power='), ['/w/a b=c.out']);
+    assert.deepEqual(M.parseScontrolStdOut('JobId=2 StdOut=/w/1.out Power=\nJobId=3 StdOut=/w/2.out Power='), ['/w/1.out', '/w/2.out']);
+    assert.deepEqual(M.parseScontrolStdOut(''), []);
+    assert.deepEqual(M.parseScontrolStdOut('JobId=1 StdErr=/e'), []);
+  });
+});
+
+describe('output_dir with % (C9)', () => {
+  const base = { job_name: 'j', partition: 'batch', mem: '4G', time: '00:10:00', gpus: 0, output_dir: 'logs' };
+  test('rejected with the reason', () => {
+    const errs = M.validateSubmitArgs({ ...base, output_dir: '/w/logs_%j' });
+    assert.equal(errs.length, 1);
+    assert.match(errs[0], /must not contain "%".*mkdir creates the literal directory/);
+  });
+  test('plain dirs still pass', () => assert.deepEqual(M.validateSubmitArgs(base), []));
+});
+
+describe('expandLocalHome (C10)', () => {
+  test('~ and ~/ expand to the home dir; trailing slash kept; others untouched', () => {
+    assert.equal(M.expandLocalHome('~'), HOME);
+    assert.equal(M.expandLocalHome('~/a/b'), `${HOME}/a/b`);
+    assert.equal(M.expandLocalHome('~/a/'), `${HOME}/a/`);
+    assert.equal(M.expandLocalHome('/abs'), '/abs');
+    assert.equal(M.expandLocalHome('~other/x'), '~other/x');
+  });
+});
+
+describe('hetjob component ids (C12)', () => {
+  for (const id of ['12345+1', '12345+0']) {
+    test(`valid ${id}`, () => { assert.equal(M.VALID_JOB_ID.test(id), true); assert.equal(M.validateJobId(id), id); });
+  }
+  for (const id of ['12345+', '+1', '12345+1;x', '12345++1']) {
+    test(`invalid ${JSON.stringify(id)}`, () => assert.throws(() => M.validateJobId(id), /Invalid job ID/));
+  }
+});
+
+describe('formatWatchLine (C14)', () => {
+  test('progress and percentage', () => {
+    const now = Date.parse('2026-01-01T01:00:00Z');
+    const w = { jobId: '7', jobName: 'n', state: 'RUNNING', progress: '1/2', submittedAt: '2026-01-01T00:30:00Z', estimatedSeconds: 3600 };
+    assert.equal(M.formatWatchLine(w, now), '  7 (n) [RUNNING tasks done 1/2] — 30min elapsed, est. 60min, ~50%');
+  });
+});

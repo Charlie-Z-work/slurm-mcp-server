@@ -112,6 +112,9 @@ async function waitFor(fn, { timeout = 10_000, every = 100 } = {}) {
 }
 
 const execs = (s) => s.logEntries().filter(e => e.kind === 'exec');
+// ssh options in ControlMaster mode ('alive'): the ControlPath that `ssh -G`
+// reports is pinned next to ProxyCommand=false; direct mode has BatchMode only (C1).
+const cmOpts = (host = 'fake') => ['-o', 'BatchMode=yes', '-o', `ControlPath=/tmp/fake-cm/${host}`, '-o', 'ProxyCommand=false'];
 const submitCmd = (s) => execs(s).map(e => e.cmd).find(c => /\| sbatch/.test(c));
 
 describe('normal scenario', async () => {
@@ -176,15 +179,15 @@ describe('normal scenario', async () => {
     const r = await s.call('cluster_info');
     assert.equal(r.isError, false, r.text);
     assert.match(r.text, /batch\*\s+up 2-00:00:00/);
-    assert.match(r.text, /=== Per-user limits ===/);
-    assert.match(r.text, /^batch: MaxTime=2-00:00:00 MaxJobsPU=none MaxTRESPU=none$/m);
+    assert.match(r.text, /=== Per-user limits \(partition QoS only; association\/job QoS not queried\) ===/);
+    assert.match(r.text, /^batch: MaxTime=2-00:00:00 MaxJobsPU=n\/a MaxTRESPU=none$/m);
     assert.match(r.text, /^short: MaxTime=04:00:00 MaxJobsPU=1 MaxTRESPU=cpu=32,gres\/gpu=2,mem=256G \(QoS shortqos\)$/m);
   });
-  test('every remote exec goes through BatchMode + bash --login -c', () => {
+  test('every remote exec goes through BatchMode + ProxyCommand=false + bash --login -c (C1)', () => {
     const e = execs(s);
     assert.ok(e.length > 0);
     for (const x of e) {
-      assert.deepEqual(x.argv.slice(0, 3), ['-o', 'BatchMode=yes', 'fake']);
+      assert.deepEqual(x.argv.slice(0, 7), [...cmOpts(), 'fake']);
       assert.equal(x.wrapped, true, x.argv.at(-1));
     }
   });
@@ -219,7 +222,7 @@ describe('normal scenario', async () => {
     assert.match(cmd, /^mkdir -p '\/home\/u\/proj\/results\/logs' && /);
     for (const line of ['#!/bin/bash', '#SBATCH --account=acct', '#SBATCH --partition=batch', '#SBATCH --job-name=train',
       '#SBATCH --time=00:15:00', '#SBATCH --mem=4G', '#SBATCH --output=/home/u/proj/results/logs/slurm_%j.out',
-      '#SBATCH --gres=gpu:1', '#SBATCH --dependency=afterok:541000', 'module load x', "cd '/home/u/proj'", "echo 'hi there'"]) {
+      '#SBATCH --gres=gpu:1', '#SBATCH --dependency=afterok:541000', 'module load x', "cd -- '/home/u/proj' || exit 1", "echo 'hi there'"]) {
       assert.ok(cmd.split('\n').includes(line), `missing line: ${line}`);
     }
     assert.ok(!/--array/.test(cmd));
@@ -310,15 +313,15 @@ describe('normal scenario', async () => {
     assert.equal(r.isError, false, r.text);
     assert.match(r.text, /Written 6 bytes/);
     const w = s.logEntries().filter(e => e.kind === 'write').at(-1);
-    assert.deepEqual(w.argv.slice(0, 3), ['-o', 'BatchMode=yes', 'fake']);
+    assert.deepEqual(w.argv.slice(0, 7), [...cmOpts(), 'fake']);
     assert.equal(w.path, "/home/u/proj/it's here.txt");
     assert.equal(w.bytes, 6);
   });
-  test('sync_files uses rsync -e "ssh -o BatchMode=yes" and validates paths', async () => {
+  test('sync_files uses rsync -e "ssh -o BatchMode=yes -o ProxyCommand=false" and validates paths (C1)', async () => {
     const r = await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x', remote_path: '~/x' });
     assert.equal(r.isError, false, r.text);
     const rs = s.logEntries().filter(e => e.kind === 'rsync').at(-1);
-    assert.deepEqual(rs.argv, ['-avz', '--partial', '-e', 'ssh -o BatchMode=yes', '--', '/tmp/x', 'fake:~/x']);
+    assert.deepEqual(rs.argv, ['-avz', '--partial', '-e', 'ssh -o BatchMode=yes -o ControlPath=/tmp/fake-cm/fake -o ProxyCommand=false', '--', '/tmp/x', 'fake:~/x']);
     await s.call('sync_files', { direction: 'download', local_path: '/tmp/y', remote_path: '-evil' });
     assert.deepEqual(s.logEntries().filter(e => e.kind === 'rsync').at(-1).argv.slice(-3), ['--', 'fake:-evil', '/tmp/y'], 'paths after "--" (R12)');
     assert.equal((await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x;rm', remote_path: '~' })).isError, true);
@@ -758,7 +761,7 @@ describe('env whitelists accept real-world values (R1)', () => {
       const r = await s.call('slurm_submit', { script: 'echo hi', job_name: 'p' });
       assert.equal(r.isError, false, r.text);
       assert.ok(submitCmd(s).includes('\n#SBATCH --partition=gpu.a100\n'));
-      assert.deepEqual(execs(s).at(-1).argv.slice(0, 3), ['-o', 'BatchMode=yes', 'u@fake']);
+      assert.deepEqual(execs(s).at(-1).argv.slice(0, 7), [...cmOpts('u@fake'), 'u@fake']);
     } finally { await s.stop(); }
   });
   test('HPC_USER with a backslash (DOMAIN\\user) survives the ssh quoting', async () => {
@@ -967,5 +970,160 @@ describe('sbatch GPU rejection hint (R13)', () => {
       assert.match(r.text, /Invalid account/);
       assert.doesNotMatch(r.text, /may not offer GPUs/);
     } finally { await s.stop(); }
+  });
+});
+
+// ---- Round-4 review fixes (C1-C14) ----
+
+describe('ProxyCommand=false only in ControlMaster mode (C1)', () => {
+  const sshCalls = (s) => s.logEntries().filter(e => e.kind === 'exec' || e.kind === 'write');
+  const rsyncE = (s) => s.logEntries().filter(e => e.kind === 'rsync').map(e => e.argv[e.argv.indexOf('-e') + 1]);
+  test('alive master: every ssh call (tools + poller) and rsync -e carry ProxyCommand=false', async () => {
+    const s = await startServer();
+    try {
+      await s.call('ssh_exec', { command: 'ls /home/u' });
+      await s.call('ssh_write_file', { path: '/home/u/f', content: 'x' });
+      await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x', remote_path: '~/x' });
+      await s.call('slurm_submit', { script: 'echo hi', job_name: 'pc' });
+      const done = await waitFor(async () => ({ ok: execs(s).some(e => /^sacct -j [\d,]+ --format=JobID/.test(e.cmd)) }));
+      assert.ok(done.ok, 'poller ran a batched sacct');
+      const calls = sshCalls(s);
+      assert.ok(calls.length >= 4);
+      for (const c of calls) assert.deepEqual(c.argv.slice(0, 6), cmOpts(), JSON.stringify(c.argv));
+      assert.deepEqual(rsyncE(s), ['ssh -o BatchMode=yes -o ControlPath=/tmp/fake-cm/fake -o ProxyCommand=false']);
+      // The ControlPath comes from the local `ssh -G`, never from a remote call.
+      assert.ok(s.logEntries().some(e => e.kind === 'config' && e.argv[1] === 'fake'));
+    } finally { await s.stop(); }
+  });
+  test('unresolvable ControlPath: plain BatchMode, never ProxyCommand=false without a pinned path', async () => {
+    const s = await startServer({ env: { FAKE_CONTROLPATH: 'none', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const r = await s.call('ssh_exec', { command: 'ls /home/u' });
+      assert.equal(r.text, 'a.txt\nb.txt');
+      assert.deepEqual(execs(s).at(-1).argv.slice(0, 3), ['-o', 'BatchMode=yes', 'fake']);
+      assert.match(s.stderr(), /ControlPath for fake not resolvable via ssh -G/);
+    } finally { await s.stop(); }
+  });
+  test('unconfigured (direct mode): no ProxyCommand=false anywhere', async () => {
+    const s = await startServer({ scenario: 'master_unconfigured' });
+    try {
+      await s.call('ssh_exec', { command: 'ls /home/u' });
+      await s.call('ssh_write_file', { path: '/home/u/f', content: 'x' });
+      await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x', remote_path: '~/x' });
+      await s.call('slurm_submit', { script: 'echo hi', job_name: 'pc' });
+      const done = await waitFor(async () => ({ ok: execs(s).some(e => /^sacct -j [\d,]+ --format=JobID/.test(e.cmd)) }));
+      assert.ok(done.ok, 'poller ran a batched sacct');
+      const calls = sshCalls(s);
+      assert.ok(calls.length >= 4);
+      for (const c of calls) {
+        assert.deepEqual(c.argv.slice(0, 3), ['-o', 'BatchMode=yes', 'fake'], JSON.stringify(c.argv));
+        assert.ok(!c.argv.includes('ProxyCommand=false'));
+      }
+      assert.deepEqual(rsyncE(s), ['ssh -o BatchMode=yes']);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('busy heartbeat during blocking ssh calls (C2)', () => {
+  test('a long ssh_exec announces busyUntil = now + timeout + 5s; the end of the call clears it', async () => {
+    const s = await startServer({ env: { FAKE_DELAY_MS: '1500', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const tty = await s.tty();
+      const hbFile = join(s.home, '.claude', 'hpc-pollers', `${tty}.json`);
+      const t0 = Date.now();
+      const pending = s.call('ssh_exec', { command: 'ls /home/u', timeout: 60000 });
+      const busy = await waitFor(async () => {
+        let hb = null;
+        try { hb = JSON.parse(readFileSync(hbFile, 'utf8')); } catch { /* mid-write */ }
+        return { ok: hb?.busyUntil != null, hb };
+      }, { timeout: 5000, every: 20 });
+      assert.ok(busy.ok, `no busyUntil during the call: ${JSON.stringify(busy.hb)}`);
+      assert.ok(busy.hb.busyUntil >= t0 + 60000 + 5000 - 50, `busyUntil ${busy.hb.busyUntil - t0}ms after start`);
+      const r = await pending;
+      assert.equal(r.text, 'a.txt\nb.txt');
+      const after = JSON.parse(readFileSync(hbFile, 'utf8'));
+      assert.equal(after.busyUntil, undefined, 'heartbeat refreshed without busyUntil after the call');
+      assert.ok(after.at >= busy.hb.at);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('notification file hygiene (C3)', () => {
+  test('[null] in slurm-notifications.json: slurm_submit still reports Submitted', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'slurm-mcp-home-'));
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'slurm-notifications.json'), '[null, 7, "x"]');
+    const s = await startServer({ home, env: { SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const r = await s.call('slurm_submit', { script: 'echo hi', job_name: 'nn' });
+      assert.equal(r.isError, false, r.text);
+      assert.match(r.text, /Submitted batch job 541806/);
+      assert.equal((await s.call('workdir_get')).isError, false);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('workdir per cluster (C6)', () => {
+  test('cluster_switch: workdir_get no longer returns the other cluster\'s dir', async () => {
+    const s = await startServer({ env: { HPC_HOST: 'fake,other', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      assert.equal((await s.call('workdir_set', { path: '/home/u/on-fake' })).isError, false);
+      assert.match((await s.call('workdir_get')).text, /工作目录: \/home\/u\/on-fake/);
+      await s.call('cluster_switch', { host: 'other' });
+      const g = await s.call('workdir_get');
+      assert.doesNotMatch(g.text, /on-fake/);
+      assert.match(g.text, /未设置工作目录/);
+      await s.call('workdir_set', { path: '/home/u/on-other' });
+      await s.call('slurm_submit', { script: 'echo hi', job_name: 'o' });
+      assert.ok(submitCmd(s).includes("\ncd -- '/home/u/on-other' || exit 1\n"), submitCmd(s));
+      await s.call('cluster_switch', { host: 'fake' });
+      assert.match((await s.call('workdir_get')).text, /工作目录: \/home\/u\/on-fake/);
+    } finally { await s.stop(); }
+  });
+  test('legacy workdir file without host belongs to the first cluster', async () => {
+    const s = await startServer({ env: { HPC_HOST: 'fake,other', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const tty = await s.tty();
+      mkdirSync(join(s.home, '.claude', 'hpc-workdirs'), { recursive: true });
+      writeFileSync(join(s.home, '.claude', 'hpc-workdirs', `${tty}.json`), JSON.stringify({ tty, workdir: '/home/u/legacy', setAt: 'x' }));
+      assert.match((await s.call('workdir_get')).text, /工作目录: \/home\/u\/legacy/);
+      await s.call('cluster_switch', { host: 'other' });
+      assert.doesNotMatch((await s.call('workdir_get')).text, /legacy/);
+      await s.call('workdir_set', { path: '/home/u/o2' }); // keeps the legacy entry of "fake"
+      await s.call('cluster_switch', { host: 'fake' });
+      assert.match((await s.call('workdir_get')).text, /工作目录: \/home\/u\/legacy/);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('small portability fixes (C8, C9, C10, C12)', async () => {
+  const s = await startServer({ env: { FAKE_STDOUT: 'empty', FAKE_SCONTROL_STDOUT: '/scratch/a=b/my log.out', SLURM_MCP_POLL_MS: '600000' } });
+  after(() => s.stop());
+  test('slurm_logs: scontrol StdOut with "=" and a space is read whole (C8)', async () => {
+    const r = await s.call('slurm_logs', { job_id: '541806', lines: 5 });
+    assert.equal(r.isError, false, r.text);
+    assert.ok(execs(s).some(e => e.cmd === "scontrol show job -o '541806' 2>/dev/null"));
+    assert.ok(execs(s).some(e => e.cmd === "tail -n 5 '/scratch/a=b/my log.out'"), JSON.stringify(execs(s).map(e => e.cmd)));
+  });
+  test('slurm_submit rejects output_dir with "%" (C9)', async () => {
+    const r = await s.call('slurm_submit', { script: 'echo hi', output_dir: 'logs/%j' });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /output_dir "logs\/%j" must not contain "%"/);
+  });
+  test('sync_files expands a leading ~/ of local_path (C10)', async () => {
+    const r = await s.call('sync_files', { direction: 'download', local_path: '~/data/', remote_path: '~/x' });
+    assert.equal(r.isError, false, r.text);
+    assert.deepEqual(s.logEntries().filter(e => e.kind === 'rsync').at(-1).argv.slice(-3), ['--', 'fake:~/x', `${s.home}/data/`]);
+    const bad = await s.call('sync_files', { direction: 'upload', local_path: '~other/x', remote_path: '~/x' });
+    assert.equal(bad.isError, true);
+    assert.match(bad.text, /must be an absolute path/);
+  });
+  test('slurm_status / slurm_cancel accept a hetjob component id (C12)', async () => {
+    const st = await s.call('slurm_status', { job_id: '541806+1' });
+    assert.equal(st.isError, false, st.text);
+    assert.ok(execs(s).some(e => e.cmd === "squeue -j '541806+1'"));
+    const c = await s.call('slurm_cancel', { job_id: '541806+1' });
+    assert.equal(c.isError, false, c.text);
+    assert.ok(execs(s).some(e => e.cmd.startsWith("scancel '541806+1'")));
   });
 });

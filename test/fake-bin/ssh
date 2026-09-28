@@ -20,6 +20,10 @@
 //   FAKE_LS_EXISTS=<path>       `ls` of candidate log paths finds only this one
 //   FAKE_SQUEUE_FAIL=1          `squeue -j` fails like for a finished job
 //   FAKE_SACCTMGR_FAIL=1        sacctmgr fails (slurmdbd unreachable)
+//   FAKE_CONTROLPATH=<path>|none   what `ssh -G` reports as controlpath
+//                               (default /tmp/fake-cm/<host>)
+//   FAKE_DELAY_MS=<ms>          remote commands (not `-O check`) sleep this long
+//                               before answering (blocking-call tests)
 // Array state machine: sacct reports task 2 RUNNING until either the file named
 // by $FAKE_ARRAY_GATE exists (deterministic mode for tests) or, when no gate is
 // set, until the second sacct poll.
@@ -28,7 +32,7 @@ const { appendFileSync, existsSync, readFileSync, writeFileSync } = require('nod
 const argv = process.argv.slice(2);
 // Host: `ssh -O check <host>` or `ssh [opts] <host> <command>`.
 const oi = argv.indexOf('-O');
-const host = oi >= 0 ? argv[oi + 2] : argv[argv.length - 2];
+const host = argv[0] === '-G' ? argv[1] : oi >= 0 ? argv[oi + 2] : argv[argv.length - 2];
 const byHost = Object.fromEntries((process.env.FAKE_SCENARIO_BY_HOST || '').split(',').filter(Boolean).map(kv => kv.split(':')));
 const scenario = byHost[host] || process.env.FAKE_SCENARIO || 'normal';
 const LOG = process.env.FAKE_LOG;
@@ -43,6 +47,16 @@ function out(text, code = 0, err = '') {
   if (text) process.stdout.write(text.endsWith('\n') ? text : text + '\n');
   if (err) process.stderr.write(err.endsWith('\n') ? err : err + '\n');
   process.exit(code);
+}
+
+// --- Config dump: ssh -G <host> (local only; real ssh prints the expanded
+// ControlPath). Unconfigured hosts report "controlpath none". ---
+if (argv[0] === '-G') {
+  log({ kind: 'config' });
+  const h = argv[1];
+  const sc = byHost[h] || process.env.FAKE_SCENARIO || 'normal';
+  if (process.env.FAKE_CONTROLPATH === 'none' || sc === 'master_unconfigured') out('hostname x\ncontrolpath none\n');
+  out(`hostname x\ncontrolmaster auto\ncontrolpath ${process.env.FAKE_CONTROLPATH || `/tmp/fake-cm/${h}`}\nproxyjump bastion\n`);
 }
 
 // --- Control-master probe: ssh -O check <host> ---
@@ -61,6 +75,9 @@ if (oi >= 0) {
 }
 
 // --- Remote command: last argument ---
+if (Number(process.env.FAKE_DELAY_MS) > 0) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.FAKE_DELAY_MS));
+}
 const last = argv[argv.length - 1] || '';
 let cmd = last;
 let wrapped = false;
@@ -142,8 +159,11 @@ if (/\|\s*sbatch\b/.test(cmd) || /^sbatch\s/.test(cmd)) {
   if (process.env.FAKE_STDOUT === 'placeholder') out('/home/u/proj/results/logs/slurm_%j.out');
   if (process.env.FAKE_STDOUT === 'empty') out('');
   out(`/home/u/proj/results/logs/slurm_${r[1]}.out`);
-} else if (/^scontrol show job '/.test(cmd)) {
-  out(process.env.FAKE_SCONTROL_STDOUT || '');
+} else if (/^scontrol show job -o '/.test(cmd)) {
+  // One-line records as printed by `scontrol show job -o`, one per path
+  // (an array base id prints one record per task).
+  const paths = (process.env.FAKE_SCONTROL_STDOUT || '').split('\n').filter(Boolean);
+  out(paths.map((p, i) => `JobId=${541822 + i} JobName=x UserId=u(1) JobState=COMPLETED WorkDir=/w StdErr=${p} StdIn=/dev/null StdOut=${p} Power= TresPerNode=gres/gpu:1`).join('\n'));
 } else if (/^squeue -j /.test(cmd) && process.env.FAKE_SQUEUE_FAIL === '1') {
   out('', 1, 'slurm_load_jobs error: Invalid job id specified');
 } else if (/^sacctmgr /.test(cmd) && process.env.FAKE_SACCTMGR_FAIL === '1') {

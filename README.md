@@ -157,7 +157,7 @@ On clusters enforcing chained MFA (publickey **and** Duo), a background process 
 Save and reuse common SLURM configurations (partition, GPU count, memory, time, extra preamble lines). Apply with `template: "my-template"` on submit; an unknown template name is an error.
 
 ### 🚧 Partition Limit Awareness
-`slurm_submit` validates every parameter (job name, partition, mem, time, array, dependency, output dir) before building the script, then reads the partition's `MaxTime` and QoS per-user caps (`MaxJobsPU`, `MaxTRESPU`). It appends non-blocking ⚠️ hints when array tasks or extra jobs would serialize on a 1–2 job partition, or when gpus/mem/time exceed the cap. `cluster_info` shows a `Per-user limits` section for every partition.
+`slurm_submit` validates every parameter (job name, partition, mem, time, array, dependency, output dir) before building the script, then reads the partition's `MaxTime` and QoS per-user caps (`MaxJobsPU`, `MaxTRESPU`). It appends non-blocking ⚠️ hints when array tasks or extra jobs would serialize on a 1–2 job partition, or when gpus/mem/time exceed the cap. `cluster_info` shows a `Per-user limits` section for every partition (partition QoS only; association limits and a job QoS are not queried and may be stricter).
 
 ### 📊 Resource Report
 Summarize your compute usage over any time period — total jobs, compute hours, GPU jobs, peak memory.
@@ -191,8 +191,8 @@ Start a tmux-based interactive SSH session for commands needing 2FA, confirmatio
 | | `cluster_info` | Get cluster info + queue estimate |
 | | `cluster_switch` | Switch active cluster |
 | **Files** | `sync_files` | rsync between local and HPC |
-| **Workdir** | `workdir_set` | Set working directory |
-| | `workdir_get` | Get working directory |
+| **Workdir** | `workdir_set` | Set working directory (per window and cluster) |
+| | `workdir_get` | Get working directory (per window and cluster) |
 | **Templates** | `template_save` | Save reusable job template |
 | | `template_list` | List saved templates |
 | **Terminal** | `terminal_start` | Start tmux session |
@@ -239,7 +239,14 @@ Host mycluster
 Create the socket directory (`mkdir -p ~/.ssh/sockets`) and run `ssh mycluster`
 once in a terminal. If the master dies, tools fail fast with a "reconnect
 interactively" message and polling of that cluster pauses — nothing ever
-retries a login in the background. Set `HPC_REQUIRE_MASTER=1` so that a
+retries a login in the background. In this mode every ssh/rsync call also
+carries `-o ProxyCommand=false`: if the master dies between the local check and
+the call, ssh cannot reuse it and fails locally instead of opening a new
+connection (a doomed publickey attempt that would feed the bastion's
+fail2ban). The effective `ControlPath` (read locally with `ssh -G <host>`) is
+passed explicitly as well, because a `%C` socket name hashes the `ProxyJump`
+value and would otherwise change; if it cannot be resolved, calls run with
+`BatchMode=yes` only. Set `HPC_REQUIRE_MASTER=1` so that a
 missing `ControlPath` is also treated as "dead" instead of falling back to
 mode 2.
 
@@ -252,7 +259,7 @@ fail2ban prefer mode 1.
 
 ## Known limitations
 
-- **Synchronous ssh calls block the event loop.** Tool handlers use `execFileSync`, so while one remote command runs (up to its timeout, max 10 min for `ssh_exec`), the server handles no other request and the poller waits. Moving to async execution is planned.
+- **Synchronous ssh calls block the event loop.** Tool handlers use `execFileSync`, so while one remote command runs (up to its timeout, max 10 min for `ssh_exec`), the server handles no other request and the poller waits. The heartbeat announces `busyUntil` for the duration, so other windows do not mistake the busy server for a dead one. Moving to async execution is planned.
 - **Windows clients are not supported.** Local paths (`sync_files`, state files under `~/.claude`), the tty detection and the ControlMaster checks assume a POSIX client (macOS / Linux).
 - **The Command Guard is not a security boundary.** It only catches quoting mistakes that break the `bash --login -c '...'` transport; `ssh_exec` runs arbitrary commands as your cluster user.
 - **GPU default.** `SLURM_DEFAULT_GPUS` defaults to `1` for backward compatibility, so on a CPU-only site every `slurm_submit` without `gpus` writes `--gres=gpu:1` and sbatch rejects it; the error then suggests `SLURM_DEFAULT_GPUS=0` / `gpus: 0`. Set `SLURM_DEFAULT_GPUS=0` on such sites.

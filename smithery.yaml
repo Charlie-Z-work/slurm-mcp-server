@@ -19,6 +19,12 @@ startCommand:
       HPC_PREAMBLE:
         type: string
         description: Shell commands to run before job scripts (module loads, conda activate, etc.)
+      SLURM_DEFAULT_PARTITION:
+        type: string
+        description: Default partition for slurm_submit (default batch)
+      SLURM_DEFAULT_GPUS:
+        type: string
+        description: "Default GPU count for slurm_submit (default 1). Sites without GPUs: set SLURM_DEFAULT_GPUS=0"
   commandFunction: |-
     (config) => ({
       command: 'npx',
@@ -27,6 +33,8 @@ startCommand:
         HPC_HOST: config.HPC_HOST,
         HPC_USER: config.HPC_USER,
         SLURM_ACCOUNT: config.SLURM_ACCOUNT,
-        ...(config.HPC_PREAMBLE ? { HPC_PREAMBLE: config.HPC_PREAMBLE } : {})
+        ...(config.HPC_PREAMBLE ? { HPC_PREAMBLE: config.HPC_PREAMBLE } : {}),
+        ...(config.SLURM_DEFAULT_PARTITION ? { SLURM_DEFAULT_PARTITION: config.SLURM_DEFAULT_PARTITION } : {}),
+        ...(config.SLURM_DEFAULT_GPUS ? { SLURM_DEFAULT_GPUS: String(config.SLURM_DEFAULT_GPUS) } : {})
       }
     })

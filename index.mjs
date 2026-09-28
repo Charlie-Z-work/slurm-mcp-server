@@ -6,7 +6,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { execSync, execFileSync, execFile as execFileCb } from 'child_process';
+import { execSync, execFileSync, spawnSync, execFile as execFileCb } from 'child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync, rmdirSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { randomBytes } from 'crypto';
@@ -28,9 +28,54 @@ function requireEnv(name) {
   return val;
 }
 
+// Why: HPC_HOST / HPC_USER / SLURM_ACCOUNT are interpolated into remote
+// commands (`sacct -u USER`), #SBATCH headers and local ssh argv. A typo like
+// "mp m3" or a stray quote must stop the server at startup with a clear error
+// instead of producing broken or injectable commands later.
+const RE_ENV_TOKEN = /^[\w.-]+$/;
+function requireEnvList(name) {
+  const items = requireEnv(name).split(',').map(s => s.trim());
+  const bad = items.filter(s => !RE_ENV_TOKEN.test(s));
+  if (bad.length) {
+    process.stderr.write(`[slurm-mcp-server] ERROR: ${name} contains an invalid entry ${JSON.stringify(bad[0])} (allowed: letters, digits, _ . -; comma-separated for multiple clusters)\n`);
+    process.exit(1);
+  }
+  return items;
+}
+
+// Path validation: block shell metacharacters and traversal
+const UNSAFE_PATH = /[;|$()&<>`\n\t\r\\]/;
+function validatePath(p, label) {
+  if (UNSAFE_PATH.test(p)) return `${label} contains unsafe characters`;
+  if (p.includes('..')) return `${label} contains '..' (path traversal not allowed)`;
+  return null;
+}
+
+function envError(msg) {
+  process.stderr.write(`[slurm-mcp-server] ERROR: ${msg}\n`);
+  process.exit(1);
+}
+
 // --- Optional env vars ---
 const HPC_PREAMBLE = process.env.HPC_PREAMBLE || null;
 const NOTIFY_WEBHOOK = process.env.NOTIFY_WEBHOOK || null; // Slack/Discord webhook URL
+
+// Optional: external resource log file on the cluster (e.g. a TSV of past
+// runs). It is interpolated into a remote grep command, so validate it here.
+const RESOURCE_LOG_PATH = process.env.HPC_RESOURCE_LOG || null;
+if (RESOURCE_LOG_PATH) {
+  const err = validatePath(RESOURCE_LOG_PATH, 'HPC_RESOURCE_LOG') ||
+    (/['"\s]/.test(RESOURCE_LOG_PATH) ? 'HPC_RESOURCE_LOG contains quotes or whitespace' : null);
+  if (err) envError(err);
+}
+
+// Site defaults for slurm_submit. Not every cluster has a "batch" partition or
+// GPUs: SLURM_DEFAULT_GPUS=0 omits --gres entirely.
+const DEFAULT_PARTITION = process.env.SLURM_DEFAULT_PARTITION || 'batch';
+if (!/^[\w-]+$/.test(DEFAULT_PARTITION)) envError(`SLURM_DEFAULT_PARTITION ${JSON.stringify(DEFAULT_PARTITION)} must match [A-Za-z0-9_-]+`);
+const DEFAULT_GPUS = process.env.SLURM_DEFAULT_GPUS == null || process.env.SLURM_DEFAULT_GPUS === ''
+  ? 1 : Number(process.env.SLURM_DEFAULT_GPUS);
+if (!Number.isInteger(DEFAULT_GPUS) || DEFAULT_GPUS < 0) envError(`SLURM_DEFAULT_GPUS ${JSON.stringify(process.env.SLURM_DEFAULT_GPUS)} must be a non-negative integer (0 = do not request GPUs)`);
 
 // --- TTY detection (per-window identity) ---
 let windowTty = 'unknown';
@@ -77,7 +122,10 @@ function atomicWriteJson(path, data) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
   writeFileSync(tmp, JSON.stringify(data, null, 2));
-  renameSync(tmp, path);
+  try { renameSync(tmp, path); } catch (err) {
+    try { unlinkSync(tmp); } catch { /* best effort */ }
+    throw err;
+  }
 }
 
 function sleepSync(ms) {
@@ -89,22 +137,50 @@ function sleepSync(ms) {
 // another window registers a new one). mkdir is atomic, so a lock directory is
 // a portable cross-process mutex. Fail-open after ~2s: a stuck lock must never
 // block job submission or notifications — worst case is the old racy behavior.
+// Reclaim a stale lock dir that was observed (statSync) as `observed`.
+// Why rename instead of rmdir: two waiters can both see the same stale lock;
+// with rmdir the slower one could delete the fresh lock the faster one had
+// just created. rename is atomic (only one waiter moves a given dir), and the
+// inode + mtime check detects that what we moved is no longer the stale dir we
+// judged — in that case it is put back. Returns the path of the moved-aside
+// dir (caller removes it after taking its own lock, so the inode cannot be
+// reused by that fresh lock), or null when nothing was reclaimed.
+function reclaimStaleLock(lockDir, observed) {
+  const aside = `${lockDir}.stale-${process.pid}-${randomBytes(4).toString('hex')}`;
+  try { renameSync(lockDir, aside); } catch { return null; } // another waiter won
+  let moved;
+  try { moved = statSync(aside); } catch { return null; }
+  if (moved.ino !== observed.ino || moved.mtimeMs !== observed.mtimeMs) {
+    // We moved a fresh lock that replaced the stale one: give it back.
+    try { renameSync(aside, lockDir); } catch (err) { logDebug(`reclaimStaleLock: restore failed: ${err.message}`); }
+    return null;
+  }
+  return aside;
+}
+
 function withFileLock(path, fn) {
   const lockDir = `${path}.lock`;
   const deadline = Date.now() + 2000;
   let locked = false;
+  const asides = [];
   try { mkdirSync(dirname(path), { recursive: true }); } catch { /* surfaces below */ }
   for (;;) {
     try { mkdirSync(lockDir); locked = true; break; } catch (err) {
       if (err.code !== 'EEXIST') { logDebug(`withFileLock(${path}): ${err.message}`); break; }
       // Stale lock left by a crashed holder (critical sections take ms) — reclaim.
       try {
-        if (Date.now() - statSync(lockDir).mtimeMs > 10_000) { rmdirSync(lockDir); continue; }
+        const st = statSync(lockDir);
+        if (Date.now() - st.mtimeMs > 10_000) {
+          const aside = reclaimStaleLock(lockDir, st);
+          if (aside) { asides.push(aside); continue; }
+          // Not reclaimed (lost the race / put back): wait like any waiter.
+        }
       } catch { /* raced with the holder releasing it — just retry */ }
       if (Date.now() > deadline) break;
       sleepSync(25);
     }
   }
+  for (const a of asides) { try { rmdirSync(a); } catch { /* already gone */ } }
   if (!locked) logDebug(`withFileLock(${path}): lock not acquired within 2s, proceeding unlocked (fail-open)`);
   try { return fn(); } finally {
     if (locked) { try { rmdirSync(lockDir); } catch { /* already gone */ } }
@@ -147,23 +223,59 @@ function loadNotifications() {
 }
 
 // Callers doing read-modify-write must hold withFileLock(NOTIF_FILE).
+// Returns false when the write failed, so callers can keep the source of the
+// notification (the watch) and retry instead of losing it.
 function saveNotifications(notifs) {
   try {
     atomicWriteJson(NOTIF_FILE, notifs);
+    return true;
   } catch (err) {
     logDebug(`saveNotifications failed: ${err.message}`);
+    return false;
   }
+}
+
+// A watch is only dropped when nobody has seen the job for a long time.
+// Why lastSeenAt: the old TTL counted from submission, so a job that queued
+// for days (busy partition) silently lost its watch before it even started.
+// As long as sacct keeps returning the job, lastSeenAt is refreshed and the
+// watch never expires.
+const WATCH_MIN_TTL_MS = 48 * 3600 * 1000;
+function isWatchExpired(w, now = Date.now()) {
+  const submitted = new Date(w.submittedAt).getTime();
+  const seen = w.lastSeenAt ? new Date(w.lastSeenAt).getTime() : NaN;
+  const ref = Math.max(Number.isFinite(submitted) ? submitted : 0, Number.isFinite(seen) ? seen : 0);
+  const ttlMs = Math.max(WATCH_MIN_TTL_MS, 4 * (Number(w.estimatedSeconds) || 0) * 1000);
+  return now - ref > ttlMs;
+}
+
+// Why: the file is shared by every window's server and user-editable; a
+// valid JSON array can still hold null/garbage entries. One bad element used
+// to throw inside registerWatch (after sbatch had succeeded → "Submit failed"
+// → duplicate jobs) and in every poll cycle.
+function isValidWatch(w) {
+  return !!w && typeof w === 'object' && !Array.isArray(w) &&
+    typeof w.jobId === 'string' && /^\d+$/.test(w.jobId) &&
+    (w.host == null || (typeof w.host === 'string' && w.host.length > 0));
 }
 
 function loadWatches() {
   const data = readJsonOrQuarantine(WATCHES_FILE, [], Array.isArray);
   const now = Date.now();
-  // TTL honors the job's own time limit: a flat 48h silently dropped watches
-  // for jobs at the 2-day partition limit that queued before starting.
   return data.filter(w => {
-    const ttlMs = Math.max(48 * 3600, (w.estimatedSeconds || 0) + 24 * 3600) * 1000;
-    return now - new Date(w.submittedAt).getTime() < ttlMs;
+    if (!isValidWatch(w)) { logDebug(`Ignoring malformed watch entry: ${JSON.stringify(w)?.slice(0, 200)}`); return false; }
+    return !isWatchExpired(w, now);
   });
+}
+
+// Watches are identified by cluster + job id: two clusters can hand out the
+// same numeric job id. Entries from before multi-cluster support carry no
+// host and belong to the first configured cluster.
+function watchHost(w) {
+  return w.host || HPC_HOSTS[0];
+}
+function watchKey(w) {
+  return `${watchHost(w)}|${w.jobId}`;
 }
 
 // --- Poller heartbeat: lets other servers detect dead sessions and adopt
@@ -171,6 +283,10 @@ function loadWatches() {
 // server — without adoption, jobs outliving their session never notify). ---
 const HEARTBEAT_DIR = join(homedir(), '.claude', 'hpc-pollers');
 
+// Written by its own timer (see startHeartbeat), NOT by the poll loop: poll
+// backoff can reach 10 min, far beyond the 150s liveness window, and a live
+// server's watches were then "adopted" by other windows over and over.
+const HEARTBEAT_INTERVAL = 30_000;
 function writeHeartbeat() {
   try {
     mkdirSync(HEARTBEAT_DIR, { recursive: true });
@@ -210,10 +326,24 @@ function registerWatch(jobId, jobName, estimatedSeconds, partition) {
   });
 }
 
-function removeWatch(jobId) {
+function removeWatch(jobId, host = SSH_HOST) {
+  const key = `${host}|${jobId}`;
   withFileLock(WATCHES_FILE, () => {
-    saveWatches(loadWatches().filter(w => w.jobId !== jobId));
+    saveWatches(loadWatches().filter(w => watchKey(w) !== key));
   });
+}
+
+// registerWatch runs AFTER sbatch succeeded: it must never turn a queued job
+// into a reported failure (the model would resubmit → duplicate jobs).
+function tryRegisterWatch(...args) {
+  try {
+    registerWatch(...args);
+    return null;
+  } catch (err) {
+    const msg = String(err?.message ?? err);
+    logDebug(`registerWatch failed: ${msg}`);
+    return msg;
+  }
 }
 
 function parseTimeToSeconds(timeStr) {
@@ -286,11 +416,41 @@ function isTerminalState(state) {
 // sacct JobID → { baseId, taskKey }. Array jobs have no bare "12345" row, only
 // "12345_1", "12345_[2-10]" (+ ".batch"/".extern" steps), so lookups by the
 // submitted id found nothing and array jobs were never reported complete.
+// Heterogeneous jobs report one row per component, "12345+0", "12345+1"
+// (+ steps); they fold into the base id with `het` = component index, so the
+// watch completes only when every component is terminal.
 function parseSacctJobId(rawId) {
-  const noStep = String(rawId).split('.')[0];
-  const m = noStep.match(/^(\d+)(?:_(\d+|\[[^\]]*\]))?$/);
+  const noStep = String(rawId).trim().split('.')[0];
+  const m = noStep.match(/^(\d+)(?:\+(\d+))?(?:_(\d+|\[[^\]]*\]))?$/);
   if (!m) return null;
-  return { baseId: m[1], taskKey: m[2] ?? null };
+  const out = { baseId: m[1], taskKey: m[3] ?? null };
+  if (m[2] != null) out.het = m[2];
+  return out;
+}
+
+// Key of one schedulable unit inside a job: array task ("3", "[2-10]"),
+// heterogeneous component ("+1"), or null for a plain job.
+function unitKey(parsed) {
+  if (parsed.taskKey != null) return parsed.taskKey;
+  if (parsed.het != null) return `+${parsed.het}`;
+  return null;
+}
+
+// Batched poll output ("JobID|State" rows) → Map(baseId → Map(unitKey → state)).
+// The allocation row precedes its .batch/.extern steps, so first-seen wins.
+function aggregateSacctRows(text) {
+  const byJob = new Map();
+  for (const line of String(text || '').split('\n')) {
+    const [rawId, state] = line.split('|').map(s => s?.trim());
+    if (!rawId || !state) continue;
+    const parsed = parseSacctJobId(rawId);
+    if (!parsed) continue;
+    if (!byJob.has(parsed.baseId)) byJob.set(parsed.baseId, new Map());
+    const units = byJob.get(parsed.baseId);
+    const k = unitKey(parsed);
+    if (!units.has(k)) units.set(k, state);
+  }
+  return byJob;
 }
 
 // How many array tasks a pending-range key like "[2-10%2]" or "[1,3,5-7]"
@@ -313,7 +473,9 @@ function countTasksInKey(taskKey) {
 // partial completion must keep the watch alive.
 function summarizeJobRows(taskStates) {
   const states = [...taskStates.values()];
-  const isArray = [...taskStates.keys()].some(k => k !== null);
+  const keys = [...taskStates.keys()];
+  const isArray = keys.some(k => k !== null && !String(k).startsWith('+'));
+  const isHet = keys.some(k => k !== null && String(k).startsWith('+'));
   const allDone = states.length > 0 && states.every(isTerminalState);
   let ok = 0, failed = 0;
   const failedKinds = new Map();
@@ -324,7 +486,10 @@ function summarizeJobRows(taskStates) {
     else { failed += n; failedKinds.set(baseState(st), (failedKinds.get(baseState(st)) || 0) + n); }
   }
   const running = states.some(st => baseState(st) === 'RUNNING');
-  return { isArray, allDone, ok, failed, failedKinds, running, states };
+  // Single verdict for non-array jobs: for a hetjob the first non-COMPLETED
+  // component decides (a plain job has exactly one state).
+  const verdict = states.find(st => baseState(st) !== 'COMPLETED') ?? states[0];
+  return { isArray, isHet, allDone, ok, failed, failedKinds, running, states, verdict };
 }
 
 const MAX_PENDING = 50;
@@ -337,20 +502,28 @@ function markCompleted(watch, state, summary = null) {
 
   logDebug(`Job ${watch.jobId} (${watch.jobName}) → ${state}`);
 
-  // Persist to disk (survives process restart, no memory-only state)
-  withFileLock(NOTIF_FILE, () => {
+  // Persist to disk (survives process restart, no memory-only state).
+  // Why return early on failure: the caller then keeps the watch and retries
+  // next cycle; removing it would lose the notification for good. The other
+  // channels wait too, so a retry does not repeat desktop/webhook alerts.
+  const persisted = withFileLock(NOTIF_FILE, () => {
     const notifs = loadNotifications();
     if (notifs.length >= MAX_PENDING) notifs.shift();
     notifs.push({
       jobId: watch.jobId,
+      host: watchHost(watch),
       jobName: watch.jobName,
       state,
       message: msg,
       completedAt: new Date().toISOString(),
       tty: watch.tty,
     });
-    saveNotifications(notifs);
+    return saveNotifications(notifs);
   });
+  if (!persisted) {
+    logDebug(`Notification for job ${watch.jobId} not persisted; keeping the watch to retry next cycle`);
+    return false;
+  }
 
   // Update bridge file for cross-session notification (NanoClaw integration)
   try {
@@ -395,21 +568,26 @@ function markCompleted(watch, state, summary = null) {
     }
   }
 
-  // MCP logging notification — attempt to push into Claude Code conversation
+  // MCP logging notification — attempt to push into Claude Code conversation.
+  // Requires capabilities.logging (declared on the McpServer); without it the
+  // SDK drops the message silently. Only log "sent" once the write resolved.
   try {
     if (server?.server?.sendLoggingMessage) {
-      server.server.sendLoggingMessage({
+      Promise.resolve(server.server.sendLoggingMessage({
         level: 'warning',
         logger: 'slurm-watch',
         data: msg,
-      });
-      logDebug(`MCP logging notification sent: ${msg}`);
+      })).then(
+        () => logDebug(`MCP logging notification sent: ${msg}`),
+        (err) => logDebug(`MCP logging notification failed: ${String(err?.message ?? err)}`),
+      );
     } else {
       logDebug('MCP sendLoggingMessage not available');
     }
   } catch (err) {
     logDebug(`MCP logging notification failed: ${err.message}`);
   }
+  return true;
 }
 
 function drainNotifications() {
@@ -456,165 +634,188 @@ function currentPollDelay() {
 // no auth attempt). Chained MFA (publickey+Duo) means a background process
 // can NEVER re-authenticate — dead master ⇒ pause, tell the human.
 function masterAlive(host) {
+  // execFileSync, not a shell string: `host` comes from the shared watch file.
   try {
-    execSync(`ssh -O check ${host}`, { timeout: 3000, stdio: 'ignore' });
+    execFileSync('ssh', ['-O', 'check', String(host)], { timeout: 3000, stdio: 'ignore' });
     return true;
   } catch { return false; }
 }
 
-function startWatchPolling() {
-  async function poll() {
-    // Orphan guard: if the parent Claude session died we get re-parented to
-    // PID 1 — exit instead of polling forever (2026-07-02: 28 zombies found).
-    if (process.ppid === 1) {
-      logDebug('Parent process gone (ppid=1), exiting to avoid zombie polling.');
-      process.exit(0);
-    }
+// Refresh lastSeenAt at most this often (each refresh rewrites the watch file).
+const LAST_SEEN_REFRESH_MS = 5 * 60_000;
 
-    pollCount++;
-    lastPollTime = new Date().toISOString();
-    lastPollError = null;
+async function pollOnce() {
+  // Orphan guard: if the parent Claude session died we get re-parented to
+  // PID 1 — exit instead of polling forever (2026-07-02: 28 zombies found).
+  if (process.ppid === 1) {
+    logDebug('Parent process gone (ppid=1), exiting to avoid zombie polling.');
+    process.exit(0);
+  }
 
-    let watches;
-    try {
-      watches = loadWatches();
-    } catch (err) {
-      lastPollError = `loadWatches: ${String(err?.message ?? err)}`;
+  pollCount++;
+  lastPollTime = new Date().toISOString();
+  lastPollError = null;
+
+  let watches;
+  try {
+    watches = loadWatches();
+  } catch (err) {
+    lastPollError = `loadWatches: ${String(err?.message ?? err)}`;
+    logDebug(lastPollError);
+    return;
+  }
+
+  // Adopt orphaned watches: their owning session is gone, so nobody polls
+  // them and their jobs would complete silently. Rewriting tty hands them
+  // to this poller (from next cycle). 90s grace avoids racing a server that
+  // registered a watch before its first heartbeat.
+  const isOrphan = (w) => w.tty !== windowTty && !pollerAlive(w.tty) &&
+    Date.now() - new Date(w.submittedAt).getTime() > 90_000;
+  if (watches.some(isOrphan)) {
+    // Re-read under the lock so we never clobber a concurrent registration.
+    watches = withFileLock(WATCHES_FILE, () => {
+      const fresh = loadWatches();
+      for (const w of fresh) {
+        if (isOrphan(w)) {
+          logDebug(`Adopting orphan watch ${w.jobId} (${w.jobName}) from dead session ${w.tty}`);
+          w.tty = windowTty;
+        }
+      }
+      saveWatches(fresh);
+      return fresh;
+    });
+  }
+
+  // Only poll watches belonging to this window's tty
+  const myWatches = watches.filter(w => w.tty === windowTty);
+  if (!myWatches.length) return;
+
+  const completedKeys = new Set();
+  let stateChanged = false;
+
+  // Group by cluster; one batched sacct per host. Never generate network
+  // traffic toward a host without a live master: each doomed reconnect is
+  // a failed auth that feeds the bastion's fail2ban.
+  const byHost = new Map();
+  for (const w of myWatches) {
+    const h = watchHost(w);
+    if (!byHost.has(h)) byHost.set(h, []);
+    byHost.get(h).push(w);
+  }
+
+  const stateMap = new Map(); // key: `${host}|${baseJobId}` → Map(unitKey → state)
+  let anyHostFailed = false;
+  for (const [host, hostWatches] of byHost) {
+    if (!masterAlive(host)) {
+      anyHostFailed = true;
+      lastPollError = `SSH master to ${host} is dead — its watches paused (backoff ${Math.round(currentPollDelay() / 1000)}s). Reconnect interactively: run \`ssh ${host}\` in a terminal (needs Duo).`;
       logDebug(lastPollError);
-      return;
+      continue;
     }
-
-    // Announce liveness before any early return — adoption below relies on it.
-    writeHeartbeat();
-
-    // Adopt orphaned watches: their owning session is gone, so nobody polls
-    // them and their jobs would complete silently. Rewriting tty hands them
-    // to this poller (from next cycle). 90s grace avoids racing a server that
-    // registered a watch before its first heartbeat.
-    const isOrphan = (w) => w.tty !== windowTty && !pollerAlive(w.tty) &&
-      Date.now() - new Date(w.submittedAt).getTime() > 90_000;
-    if (watches.some(isOrphan)) {
-      // Re-read under the lock so we never clobber a concurrent registration.
-      watches = withFileLock(WATCHES_FILE, () => {
-        const fresh = loadWatches();
-        for (const w of fresh) {
-          if (isOrphan(w)) {
-            logDebug(`Adopting orphan watch ${w.jobId} (${w.jobName}) from dead session ${w.tty}`);
-            w.tty = windowTty;
-          }
-        }
-        saveWatches(fresh);
-        return fresh;
+    const jobIds = hostWatches.map(w => w.jobId).join(',');
+    try {
+      const escaped = `sacct -j ${jobIds} --format=JobID%-20,State -P -n`.replace(/'/g, "'\"'\"'");
+      const { stdout } = await execFileAsync('ssh', [...sshBaseArgs(), host, `bash --login -c '${escaped}'`], {
+        timeout: 15000, encoding: 'utf8',
       });
-    }
-
-    // Only poll watches belonging to this window's tty
-    const myWatches = watches.filter(w => w.tty === windowTty);
-    if (!myWatches.length) return;
-
-    const completedIds = new Set();
-    let stateChanged = false;
-
-    // Group by cluster; one batched sacct per host. Never generate network
-    // traffic toward a host without a live master: each doomed reconnect is
-    // a failed auth that feeds the bastion's fail2ban.
-    const byHost = new Map();
-    for (const w of myWatches) {
-      const h = w.host || SSH_HOST;
-      if (!byHost.has(h)) byHost.set(h, []);
-      byHost.get(h).push(w);
-    }
-
-    const stateMap = new Map(); // key: `${host}|${baseJobId}` → Map(taskKey → state)
-    let anyHostFailed = false;
-    for (const [host, hostWatches] of byHost) {
-      if (!masterAlive(host)) {
-        anyHostFailed = true;
-        lastPollError = `SSH master to ${host} is dead — its watches paused (backoff ${Math.round(currentPollDelay() / 1000)}s). Reconnect interactively: run \`ssh ${host}\` in a terminal (needs Duo).`;
-        logDebug(lastPollError);
-        continue;
-      }
-      const jobIds = hostWatches.map(w => w.jobId).join(',');
-      try {
-        const escaped = `sacct -j ${jobIds} --format=JobID%-20,State -P -n`.replace(/'/g, "'\"'\"'");
-        const { stdout } = await execFileAsync('ssh', [...sshBaseArgs(), host, `bash --login -c '${escaped}'`], {
-          timeout: 15000, encoding: 'utf8',
-        });
-        for (const line of stdout.split('\n')) {
-          const [rawId, state] = line.split('|').map(s => s?.trim());
-          if (!rawId || !state) continue;
-          // Normalize "12345.batch" / "12345_7" / "12345_[8-10]" to the base id
-          // and collect every array task's state under it. The allocation row
-          // precedes its .batch/.extern steps, so first-seen per task wins.
-          const parsed = parseSacctJobId(rawId);
-          if (!parsed) continue;
-          const key = `${host}|${parsed.baseId}`;
-          if (!stateMap.has(key)) stateMap.set(key, new Map());
-          const tasks = stateMap.get(key);
-          if (!tasks.has(parsed.taskKey)) tasks.set(parsed.taskKey, state);
-        }
-      } catch (err) {
-        anyHostFailed = true;
-        lastPollError = `batch sacct (${host}): ${String(err?.message ?? err)} (backoff ${Math.round(currentPollDelay() / 1000)}s)`;
-        logDebug(`Batch poll failed for ${host}: ${String(err?.message ?? err)}`);
-      }
-    }
-    if (anyHostFailed) consecutivePollFailures++; else consecutivePollFailures = 0;
-
-    for (const w of myWatches) {
-      const tasks = stateMap.get(`${w.host || SSH_HOST}|${w.jobId}`);
-      if (!tasks || !tasks.size) continue; // UNKNOWN: host failed or sacct lag
-      const sum = summarizeJobRows(tasks);
-      if (sum.allDone) {
-        if (sum.isArray) {
-          const kinds = [...sum.failedKinds].map(([k, n]) => `${k}×${n}`).join(', ');
-          const summary = `${sum.ok} ok / ${sum.failed} failed${kinds ? ` (${kinds})` : ''}`;
-          markCompleted(w, sum.failed ? 'FAILED' : 'COMPLETED', summary);
-        } else {
-          markCompleted(w, sum.states[0]);
-        }
-        completedIds.add(w.jobId);
-        continue;
-      }
-      // Still active: RUNNING if any task runs, else the (single) pending state.
-      const newState = sum.isArray
-        ? (sum.running ? 'RUNNING' : baseState(sum.states.find(st => !isTerminalState(st))))
-        : sum.states[0];
-      const total = [...tasks.keys()].reduce((n, k) => n + countTasksInKey(k), 0);
-      const progress = sum.isArray ? `${sum.ok + sum.failed}/${total}` : undefined;
-      if (w.state !== newState || w.progress !== progress) {
-        w.state = newState;
-        w.progress = progress;
-        stateChanged = true;
-      }
-    }
-
-    if (completedIds.size || stateChanged) {
-      // Re-read from disk (under lock) to avoid overwriting watches added
-      // during the async poll by this or another window's server.
-      withFileLock(WATCHES_FILE, () => {
-        const updated = loadWatches()
-          .filter(w => !completedIds.has(w.jobId))
-          .map(w => {
-            // Apply state updates from this poll cycle
-            const polled = myWatches.find(m => m.jobId === w.jobId);
-            return polled || w;
-          });
-        saveWatches(updated);
-      });
+      // Normalize "12345.batch" / "12345_7" / "12345_[8-10]" / "12345+1" to
+      // the base id and collect every task/component state under it.
+      for (const [baseId, units] of aggregateSacctRows(stdout)) stateMap.set(`${host}|${baseId}`, units);
+    } catch (err) {
+      anyHostFailed = true;
+      lastPollError = `batch sacct (${host}): ${String(err?.message ?? err)} (backoff ${Math.round(currentPollDelay() / 1000)}s)`;
+      logDebug(`Batch poll failed for ${host}: ${String(err?.message ?? err)}`);
     }
   }
+  if (anyHostFailed) consecutivePollFailures++; else consecutivePollFailures = 0;
+
+  const nowMs = Date.now();
+  for (const w of myWatches) {
+    const tasks = stateMap.get(watchKey(w));
+    if (!tasks || !tasks.size) continue; // UNKNOWN: host failed or sacct lag
+    // sacct still knows the job → keep the watch alive (see isWatchExpired).
+    const seen = w.lastSeenAt ? new Date(w.lastSeenAt).getTime() : 0;
+    if (!(nowMs - seen < LAST_SEEN_REFRESH_MS)) {
+      w.lastSeenAt = new Date(nowMs).toISOString();
+      stateChanged = true;
+    }
+    const sum = summarizeJobRows(tasks);
+    if (sum.allDone) {
+      let delivered;
+      if (sum.isArray) {
+        const kinds = [...sum.failedKinds].map(([k, n]) => `${k}×${n}`).join(', ');
+        const summary = `${sum.ok} ok / ${sum.failed} failed${kinds ? ` (${kinds})` : ''}`;
+        delivered = markCompleted(w, sum.failed ? 'FAILED' : 'COMPLETED', summary);
+      } else {
+        delivered = markCompleted(w, sum.verdict);
+      }
+      // Not persisted → keep the watch; the next cycle retries.
+      if (delivered) completedKeys.add(watchKey(w));
+      continue;
+    }
+    // Still active: RUNNING if any task/component runs, else the pending state.
+    const newState = (sum.isArray || sum.isHet)
+      ? (sum.running ? 'RUNNING' : baseState(sum.states.find(st => !isTerminalState(st))))
+      : sum.states[0];
+    const total = [...tasks.keys()].reduce((n, k) => n + countTasksInKey(k), 0);
+    const progress = sum.isArray ? `${sum.ok + sum.failed}/${total}` : undefined;
+    if (w.state !== newState || w.progress !== progress) {
+      w.state = newState;
+      w.progress = progress;
+      stateChanged = true;
+    }
+  }
+
+  if (completedKeys.size || stateChanged) {
+    // Re-read from disk (under lock) to avoid overwriting watches added
+    // during the async poll by this or another window's server. Matching is by
+    // host + job id: the same numeric id can exist on two clusters.
+    const polledByKey = new Map(myWatches.map(m => [watchKey(m), m]));
+    withFileLock(WATCHES_FILE, () => {
+      const updated = loadWatches()
+        .filter(w => !completedKeys.has(watchKey(w)))
+        .map(w => polledByKey.get(watchKey(w)) || w);
+      saveWatches(updated);
+    });
+  }
+}
+
+// Runs one poll cycle and never lets it throw: an uncaught error used to end
+// the setTimeout chain (or crash the process via an unhandled rejection), so
+// every watch silently stopped being polled.
+async function safePoll(fn = pollOnce) {
+  try {
+    await fn();
+  } catch (err) {
+    lastPollError = `poll cycle crashed: ${String(err?.message ?? err)}`;
+    consecutivePollFailures++;
+    logDebug(`${lastPollError}\n${err?.stack ?? ''}`);
+  }
+}
+
+function pollState() {
+  return { lastPollTime, lastPollError, pollCount, consecutivePollFailures };
+}
+
+function startHeartbeat() {
+  writeHeartbeat();
+  setInterval(writeHeartbeat, HEARTBEAT_INTERVAL).unref();
+}
+
+function startWatchPolling() {
   // setTimeout chain: wait for poll to finish before scheduling next.
   // Delay is dynamic: exponential backoff under sustained failure.
   (function scheduleNext() {
-    setTimeout(async () => { await poll(); scheduleNext(); }, currentPollDelay());
+    setTimeout(async () => {
+      try { await safePoll(); } finally { scheduleNext(); }
+    }, currentPollDelay());
   })();
 }
 
 // --- Multi-cluster: HPC_HOST can be comma-separated (e.g. "cluster1,cluster2") ---
-const HPC_HOSTS = requireEnv('HPC_HOST').split(',').map(s => s.trim());
-const HPC_USERS = requireEnv('HPC_USER').split(',').map(s => s.trim());
-const SLURM_ACCOUNTS = requireEnv('SLURM_ACCOUNT').split(',').map(s => s.trim());
+const HPC_HOSTS = requireEnvList('HPC_HOST');
+const HPC_USERS = requireEnvList('HPC_USER');
+const SLURM_ACCOUNTS = requireEnvList('SLURM_ACCOUNT');
 
 // Default to first cluster
 let SSH_HOST = HPC_HOSTS[0];
@@ -678,9 +879,11 @@ function sshExec(cmd, timeout = TIMEOUT) {
     return doExec();
   } catch (e) {
     const stderr = e.stderr ? String(e.stderr).trim() : '';
-    if (stderr.includes('Connection closed') || stderr.includes('Connection reset') ||
+    // Exit 255 = ssh itself failed. Other codes come from the remote command,
+    // whose own stderr may well say "Connection refused" (e.g. sacct → slurmdbd).
+    if (e.status === 255 && (stderr.includes('Connection closed') || stderr.includes('Connection reset') ||
         stderr.includes('Connection refused') || stderr.includes('not a socket') ||
-        e.message?.includes('socket is not connected')) {
+        e.message?.includes('socket is not connected'))) {
       e.message = `SSH connection to ${SSH_HOST} failed mid-command (master may have just died, ` +
         `or the bastion is fail2ban-banned). Do NOT retry in a loop — check \`ssh -O check ${SSH_HOST}\`, ` +
         `reconnect interactively if needed.\nOriginal: ${e.message}`;
@@ -690,9 +893,14 @@ function sshExec(cmd, timeout = TIMEOUT) {
   }
 }
 
+// Why the second argument: `instructions` and `capabilities` are ServerOptions.
+// `instructions` used to sit in serverInfo (ignored), and without
+// capabilities.logging the SDK silently drops sendLoggingMessage.
 const server = new McpServer({
   name: 'slurm-mcp-server',
   version: '2.2.0',
+}, {
+  capabilities: { logging: {} },
   instructions: 'SLURM HPC tools via SSH. 26 tools for job management, file sync, monitoring, and interactive sessions. Supports multi-cluster setups.',
 });
 
@@ -726,19 +934,27 @@ server.tool = function(...toolArgs) {
 // --- SSH ---
 
 server.tool('ssh_status', 'Check if SSH connection to HPC is active', {}, async () => {
-  try {
-    const out = exec(`ssh -O check ${SSH_HOST} 2>&1`, 5000);
+  // argv, not a shell string; `ssh -O check` reports on stderr.
+  const r = spawnSync('ssh', ['-O', 'check', SSH_HOST], { timeout: 5000, encoding: 'utf8' });
+  if (r.status === 0) {
+    const out = `${r.stdout || ''}${r.stderr || ''}`.trim();
     return { content: [{ type: 'text', text: `SSH active: ${out}` }] };
-  } catch (e) {
-    return { content: [{ type: 'text', text: `SSH not connected. Run "ssh ${SSH_HOST}" in terminal to connect.` }] };
   }
+  return { content: [{ type: 'text', text: `SSH not connected. Run "ssh ${SSH_HOST}" in terminal to connect.` }] };
 });
 
 // === Command Guard: reject prohibited patterns ===
+// Not a security boundary: it catches the quoting mistakes that break the
+// single-quoted `bash --login -c '...'` transport, nothing more.
+// `<<-EOF` (tab-stripping heredoc) is a heredoc too.
+const HEREDOC_RE = /<<-?\s*['"]?\w+/;
 const BLOCKED_PATTERNS = [
-  { re: /<<\s*['"]?\w+['"]?/, reason: 'heredoc 禁止。写本地文件 → sync_files 上传' },
-  { re: /python[23]?\s+-c\s/, reason: 'python -c 禁止。写 .py 文件 → sync_files 上传 → ssh_exec python script.py' },
-  { re: /\n.*\n.*\n/, reason: '多行命令禁止（>2行）。写脚本 → sync_files 上传 → ssh_exec bash script.sh' },
+  { re: HEREDOC_RE, reason: 'heredoc 禁止。写本地文件 → sync_files 上传' },
+  // python, python3, python3.11 … with any flags before -c (python -u -c, -uc).
+  { re: /\bpython[\d.]*(\s+-\w+)*\s+-\w*c\b/, reason: 'python -c 禁止。写 .py 文件 → sync_files 上传 → ssh_exec python script.py' },
+  // Three or more lines (two newlines followed by more content); a single
+  // trailing newline does not count as a line.
+  { re: /\n[^]*\n[^]*\S/, reason: '多行命令禁止（>2行）。写脚本 → sync_files 上传 → ssh_exec bash script.sh' },
   { re: /"/, reason: '双引号禁止（多层 shell 转义会吞字符）。用 ssh_read_file 读取后在本地处理' },
   { re: /'/, reason: '单引号禁止（sshExec 用单引号包裹命令，嵌套必坏）。避免 echo 拼接，拆成多条简单命令' },
   { re: /^\s*grep\b/, reason: 'grep 禁止通过 ssh_exec 执行（引号/正则转义必坏）。用 ssh_read_file 或 ssh_exec cat 取回内容 → 在本地 Grep' },
@@ -761,8 +977,13 @@ function guardCommand(cmd) {
 const QUIET_RE = /^\s*(cd|pwd|mkdir|cp|mv|rm|rmdir|chmod|chown|ln|touch|source|export|module\s+load|module\s+unload|conda\s+activate)\b/;
 const NAV_RE = /^\s*(ls|ll|la|ls\s+-[alh]|du|df|wc|file|stat|which|whoami|hostname|date|echo)\b/;
 
+// Why the compound check: "cd /w && python run.py" starts with a quiet verb
+// but its real output comes from the later command — never truncate those.
+const COMPOUND_RE = /[;&|]/;
+
 function compressOutput(cmd, out) {
   if (!out) return '(no output)';
+  if (COMPOUND_RE.test(cmd)) return out;
   if (QUIET_RE.test(cmd)) {
     const first = out.split('\n')[0];
     return first ? `✓ ${first}` : '✓ done';
@@ -778,7 +999,9 @@ function compressOutput(cmd, out) {
 
 server.tool('ssh_exec', 'Execute a command on HPC via SSH', {
   command: z.string().describe('Shell command to run on HPC. Max 500 chars. No heredoc, no python -c, no multi-line code. Write scripts locally and upload via sync_files.'),
-  timeout: z.number().optional().default(30000).describe('Timeout in ms'),
+  // Why min 1000: Node treats timeout 0 as "no timeout", and the ssh call is
+  // synchronous — it would block the whole server indefinitely.
+  timeout: z.number().int().min(1000).max(600000).optional().default(30000).describe('Timeout in ms (1000-600000, default 30000)'),
   verbose: z.boolean().optional().default(false).describe('Force full output (bypass noise filter)'),
 }, async (args) => {
   // Hard block prohibited patterns
@@ -927,16 +1150,23 @@ server.tool('slurm_status', 'Check SLURM job status (squeue + sacct). For array 
   try {
     if (args.job_id) {
       const jid = validateJobId(args.job_id);
+      // Why independent: squeue errors out for jobs that already left the
+      // queue ("Invalid job id specified"), which used to hide the sacct
+      // history — exactly the case where it matters. Error only if both fail.
       // Quoted: "12345_[1-5]" would otherwise be a bash glob.
-      const squeue = sshExec(`squeue -j '${jid}'`, 15000);
-      const sacct = sshExec(`sacct -j '${jid}'`, 15000);
+      const run = (cmd) => {
+        try { return { ok: true, text: sshExec(cmd, 15000) }; } catch (e) { return { ok: false, text: String(e?.message ?? e) }; }
+      };
+      const squeue = run(`squeue -j '${jid}'`);
+      const sacct = run(`sacct -j '${jid}'`);
       const text = [
         '=== squeue ===',
-        squeue || '(no output)',
+        squeue.ok ? (squeue.text || '(no output)') : `(squeue failed: ${squeue.text})`,
         '',
         '=== sacct ===',
-        sacct || '(no output)',
+        sacct.ok ? (sacct.text || '(no output)') : `(sacct failed: ${sacct.text})`,
       ].join('\n');
+      if (!squeue.ok && !sacct.ok) return { content: [{ type: 'text', text: `Error: ${text}` }], isError: true };
       return { content: [{ type: 'text', text }] };
     }
     const out = sshExec(`squeue -u ${SSH_USER}`, 15000);
@@ -948,16 +1178,49 @@ server.tool('slurm_status', 'Check SLURM job status (squeue + sacct). For array 
 
 // --- Resource Check (MUST call before any sbatch) ---
 
+// Short reason for a failed sshExec: the remote stderr if there is one (the
+// first message line is "Command failed: ssh ... <whole command>").
+function firstLine(err) {
+  const msg = String(err?.message ?? err);
+  const stderr = msg.match(/STDERR: (.*)/)?.[1]?.trim();
+  if (stderr) return stderr;
+  return msg.split('\n').find(l => l.trim())?.trim() || 'unknown error';
+}
+
+// Returns { status: 'ok' | 'empty' | 'error', text, reason }.
+// Why two queries: MaxRSS lives only on the step rows (.batch/.extern), the
+// allocation row has it empty (verified on SMU SuperPOD). The old single
+// `grep COMPLETED | grep -iF name` dropped every step row (they are named
+// "batch"/"extern"), so resource_check never saw memory. Step 1 finds the
+// recent COMPLETED jobs whose name contains the pattern (case-insensitive, as
+// before); step 2 fetches all their rows including steps. Filtering is done
+// here, not with a remote `| grep`, so a failing sacct is an error, not "no data".
 function queryResourceHistory(jobNamePattern, limit = 5) {
-  // Sanitize: only allow alphanumeric, dash, underscore, dot for grep -F
-  const safe = jobNamePattern.replace(/[^a-zA-Z0-9._-]/g, '');
-  if (!safe) return '';
+  const safe = String(jobNamePattern).replace(/[^a-zA-Z0-9._-]/g, '');
+  if (!safe) return { status: 'empty', text: '' };
+  let ids;
   try {
-    return sshExec(
-      `sacct -u ${SSH_USER} --format=JobID%-20,JobName%-20,Elapsed,MaxRSS,ReqMem,State -P -S $(date -d '7 days ago' +%Y-%m-%d) | grep COMPLETED | grep -iF ${safe} | tail -${limit}`,
+    const list = sshExec(
+      `sacct -u ${SSH_USER} -X -S $(date -d '7 days ago' +%Y-%m-%d) -o JobID,JobName%-64,State -P -n`,
       15000
     );
-  } catch { return ''; }
+    const needle = safe.toLowerCase();
+    ids = list.split('\n')
+      .map(l => l.split('|').map(s => s.trim()))
+      .filter(([id, name, state]) => /^\d+(_\d+)?$/.test(id || '') && baseState(state) === 'COMPLETED' &&
+        String(name || '').toLowerCase().includes(needle))
+      .map(([id]) => id)
+      .slice(-limit);
+  } catch (err) {
+    return { status: 'error', text: '', reason: firstLine(err) };
+  }
+  if (!ids.length) return { status: 'empty', text: '' };
+  try {
+    const text = sshExec(`sacct -j ${ids.join(',')} -o JobID%-20,JobName%-20,Elapsed,MaxRSS,ReqMem,State -P -n`, 15000);
+    return text.trim() ? { status: 'ok', text } : { status: 'empty', text: '' };
+  } catch (err) {
+    return { status: 'error', text: '', reason: firstLine(err) };
+  }
 }
 
 /** Parse SLURM elapsed time: D-HH:MM:SS, HH:MM:SS, or MM:SS → seconds */
@@ -971,24 +1234,50 @@ function parseElapsed(s) {
   return 0;
 }
 
+/**
+ * Memory string → MB. Accepts K/M/G/T/P suffixes (optional "B"/"iB"), decimals
+ * ("1.50G") and the old ReqMem per-node/per-cpu suffix ("4Gn", "500Mc").
+ * `bareUnit` is the unit of a suffix-less number: sacct's MaxRSS prints bytes,
+ * while a --mem request without suffix is MB. Returns null if unparsable.
+ */
+function parseMemToMB(str, bareUnit = 'B') {
+  const m = String(str ?? '').trim().match(/^(\d+(?:\.\d+)?)(?:([KMGTP])(?:i?B)?)?([nc])?$/i);
+  if (!m) return null;
+  const mult = { B: 1 / (1024 * 1024), K: 1 / 1024, M: 1, G: 1024, T: 1024 ** 2, P: 1024 ** 3 }[(m[2] || bareUnit).toUpperCase()];
+  return parseFloat(m[1]) * mult;
+}
+
+/**
+ * sacct rows "JobID|JobName|Elapsed|MaxRSS|ReqMem|State" → per-job peaks.
+ * Rows are grouped by job (array task = its own job, steps fold into it); a
+ * job counts when its allocation row is COMPLETED (or, without an allocation
+ * row, any of its rows), and its MaxRSS is the maximum over all its steps.
+ */
 function parseResourceHistory(sacctOutput) {
   if (!sacctOutput) return null;
-  const lines = sacctOutput.split('\n').filter(l => l.includes('COMPLETED'));
-  if (!lines.length) return null;
-  let maxMem = 0, maxTime = 0;
-  for (const line of lines) {
-    const parts = line.split('|');
-    // Parse MaxRSS (e.g. "1201368K" or "1.2G")
-    const rss = parts[3] || '';
-    if (rss.endsWith('K')) maxMem = Math.max(maxMem, parseInt(rss) / 1024 / 1024); // → GB
-    else if (rss.endsWith('M')) maxMem = Math.max(maxMem, parseInt(rss) / 1024);
-    else if (rss.endsWith('G')) maxMem = Math.max(maxMem, parseFloat(rss));
-    // Parse Elapsed (HH:MM:SS or MM:SS or D-HH:MM:SS)
-    const elapsed = parts[2] || '';
-    const secs = parseElapsed(elapsed);
-    if (secs > 0) maxTime = Math.max(maxTime, secs);
+  const jobs = new Map();
+  for (const line of sacctOutput.split('\n')) {
+    const parts = line.split('|').map(s => s.trim());
+    const id = parts[0];
+    if (!id || !parseSacctJobId(id)) continue;
+    const key = id.split('.')[0];
+    const isStep = id.includes('.');
+    if (!jobs.has(key)) jobs.set(key, { mainState: null, anyCompleted: false, rssMB: 0, secs: 0 });
+    const j = jobs.get(key);
+    const state = baseState(parts[5]);
+    if (!isStep) j.mainState = state;
+    if (state === 'COMPLETED') j.anyCompleted = true;
+    const rss = parseMemToMB(parts[3]);
+    if (rss != null) j.rssMB = Math.max(j.rssMB, rss);
+    j.secs = Math.max(j.secs, parseElapsed(parts[2] || ''));
   }
-  return { maxMemGB: maxMem, maxTimeSec: maxTime, count: lines.length };
+  const done = [...jobs.values()].filter(j => (j.mainState ? j.mainState === 'COMPLETED' : j.anyCompleted));
+  if (!done.length) return null;
+  return {
+    maxMemGB: Math.max(...done.map(j => j.rssMB)) / 1024,
+    maxTimeSec: Math.max(...done.map(j => j.secs)),
+    count: done.length,
+  };
 }
 
 function formatRecommendation(hist) {
@@ -1016,44 +1305,45 @@ function checkResourceWaste(requestedMem, requestedTime, hist) {
   return warnings.length ? '\n' + warnings.join('\n') : '';
 }
 
-// Optional: external resource log file (e.g. Python-generated TSV with persistent experiment metrics)
-const RESOURCE_LOG_PATH = process.env.HPC_RESOURCE_LOG || null;
-
+// Returns { status: 'disabled' | 'ok' | 'empty' | 'error', text, reason }.
+// grep exits 1 on "no match" (→ empty) and 2 on a real error such as a
+// missing file (→ error, with grep's stderr as the reason).
 function queryResourceLog(pattern) {
-  if (!RESOURCE_LOG_PATH) return '';
-  const safe = pattern.replace(/[^a-zA-Z0-9._-]/g, '');
-  if (!safe) return '';
+  if (!RESOURCE_LOG_PATH) return { status: 'disabled', text: '' };
+  const safe = String(pattern).replace(/[^a-zA-Z0-9._-]/g, '');
+  if (!safe) return { status: 'empty', text: '' };
   try {
-    return sshExec(`cat ${RESOURCE_LOG_PATH} 2>/dev/null | grep -iF ${safe} || true`, 10000);
-  } catch { return ''; }
+    const text = sshExec(`grep -iF -e ${safe} ${RESOURCE_LOG_PATH}; test $? -le 1`, 10000);
+    return text.trim() ? { status: 'ok', text } : { status: 'empty', text: '' };
+  } catch (err) {
+    return { status: 'error', text: '', reason: firstLine(err) };
+  }
 }
 
 server.tool('resource_check', 'Check actual resource usage of past jobs (MUST call before sbatch)', {
-  job_name: z.string().describe('Job name pattern to search'),
+  job_name: z.string().describe('Job name pattern to search (case-insensitive substring of recent COMPLETED job names)'),
 }, async (args) => {
   try {
     const sections = [];
 
     // Source 1: sacct (SLURM accounting)
-    const sacctRaw = queryResourceHistory(args.job_name);
-    const hist = sacctRaw ? parseResourceHistory(sacctRaw) : null;
+    const sacct = queryResourceHistory(args.job_name);
+    const hist = sacct.status === 'ok' ? parseResourceHistory(sacct.text) : null;
 
     // Source 2: external resource log (optional, set HPC_RESOURCE_LOG env var)
-    const logRaw = queryResourceLog(args.job_name);
+    const log = queryResourceLog(args.job_name);
 
-    if (!sacctRaw && !logRaw) {
+    // "Run a benchmark" only when both sources answered and found nothing —
+    // an ssh/sacct failure is reported as such, not as missing history.
+    if (sacct.status === 'empty' && (log.status === 'empty' || log.status === 'disabled')) {
       return { content: [{ type: 'text', text: `No resource data for "${args.job_name}". Run a 1-seed benchmark first.` }] };
     }
 
-    if (sacctRaw) {
-      sections.push(`=== SLURM sacct (last 7 days) ===\n${sacctRaw}`);
-    }
-    if (logRaw) {
-      sections.push(`=== External resource log ===\n${logRaw}`);
-    }
-    if (hist) {
-      sections.push(formatRecommendation(hist));
-    }
+    if (sacct.status === 'ok') sections.push(`=== SLURM sacct (last 7 days) ===\n${sacct.text}`);
+    else if (sacct.status === 'error') sections.push(`⚠️ resource history unavailable: ${sacct.reason}`);
+    if (log.status === 'ok') sections.push(`=== External resource log ===\n${log.text}`);
+    else if (log.status === 'error') sections.push(`⚠️ resource log unavailable: ${log.reason}`);
+    if (hist) sections.push(formatRecommendation(hist));
 
     return { content: [{ type: 'text', text: sections.join('\n\n') }] };
   } catch (e) {
@@ -1070,10 +1360,7 @@ const partitionLimitsCache = new Map(); // `${host}|${partition}` → limits
 
 /** "256G" / "4096" (MB default) / "1T" → MB; null if unparsable. */
 function memToMB(mem) {
-  const m = String(mem ?? '').trim().match(/^(\d+(?:\.\d+)?)([KMGT])?B?$/i);
-  if (!m) return null;
-  const mult = { K: 1 / 1024, M: 1, G: 1024, T: 1024 * 1024 }[(m[2] || 'M').toUpperCase()];
-  return parseFloat(m[1]) * mult;
+  return parseMemToMB(mem, 'M');
 }
 
 function parseTres(str) {
@@ -1104,8 +1391,18 @@ function loadPartitionLimitsForHost() {
     });
   }
   const qosNames = [...new Set(found.map(p => p.qos).filter(Boolean))];
+  // Why a separate try: sacctmgr can fail (slurmdbd down, restricted to
+  // admins) while scontrol worked — keep the partition MaxTime we already have.
+  let q = null;
   if (qosNames.length) {
-    const q = sshExec(`sacctmgr show qos where name=${qosNames.join(',')} -P -n format=Name,MaxJobsPU,MaxSubmitPU,MaxTRESPU,MaxWall`, 15000);
+    try {
+      q = sshExec(`sacctmgr show qos where name=${qosNames.join(',')} -P -n format=Name,MaxJobsPU,MaxSubmitPU,MaxTRESPU,MaxWall`, 15000);
+    } catch (err) {
+      logDebug(`sacctmgr QoS query failed: ${String(err?.message ?? err)}`);
+      for (const p of found) p.qosUnavailable = true;
+    }
+  }
+  if (q != null) {
     const byName = new Map();
     for (const line of q.split('\n')) {
       const [name, jobs, submit, tres, wall] = line.split('|').map(x => (x ?? '').trim());
@@ -1179,17 +1476,22 @@ function partitionLimitHints(args, timeSec) {
 const RE_JOB_NAME = /^[\w.-]{1,64}$/;
 const RE_PARTITION = /^[\w-]+$/;
 const RE_MEM = /^\d+[KMGT]?$/;
-const RE_ARRAY = /^\d+(-\d+)?(,\d+(-\d+)?)*(%\d+)?$/;
-const RE_DEPENDENCY = /^(after|afterok|afternotok|afterany|aftercorr|singleton)(:\d+(_\d+)?)*(,(after|afterok|afternotok|afterany|aftercorr|singleton)(:\d+(_\d+)?)*)*$/;
+// Ranges may carry a step ("1-10:2"), as sbatch accepts.
+const RE_ARRAY = /^\d+(-\d+(:\d+)?)?(,\d+(-\d+(:\d+)?)?)*(%\d+)?$/;
+// after* types need at least one job id; singleton takes none.
+const DEP_ITEM = '((after|afterok|afternotok|afterany|aftercorr)(:\\d+(_\\d+)?)+|singleton)';
+const RE_DEPENDENCY = new RegExp(`^${DEP_ITEM}(,${DEP_ITEM})*$`);
 
 function validateSubmitArgs(args) {
   const errs = [];
   if (!RE_JOB_NAME.test(String(args.job_name))) errs.push(`job_name "${args.job_name}" must match ${RE_JOB_NAME} (letters, digits, _ . -, ≤64 chars)`);
   if (!RE_PARTITION.test(String(args.partition))) errs.push(`partition "${args.partition}" must match ${RE_PARTITION}`);
   if (!RE_MEM.test(String(args.mem))) errs.push(`mem "${args.mem}" must look like 4G / 512M / 4096`);
-  if (parseSlurmTime(args.time) == null) errs.push(`time "${args.time}" is not a SLURM time (M, M:S, H:M:S, D-H, D-H:M, D-H:M:S)`);
-  if (args.array != null && !RE_ARRAY.test(String(args.array))) errs.push(`array "${args.array}" must look like 1-10, 1,3,5-7 or 1-100%5`);
-  if (args.dependency != null && !RE_DEPENDENCY.test(String(args.dependency))) errs.push(`dependency "${args.dependency}" must look like afterok:12345 or afterany:12345_1,afterok:67890`);
+  // Whitespace is rejected (the handler trims first): the checked string must
+  // be exactly the one written into #SBATCH --time.
+  if (typeof args.time !== 'string' || args.time !== args.time.trim() || parseSlurmTime(args.time) == null) errs.push(`time "${args.time}" is not a SLURM time (M, M:S, H:M:S, D-H, D-H:M, D-H:M:S)`);
+  if (args.array != null && !RE_ARRAY.test(String(args.array))) errs.push(`array "${args.array}" must look like 1-10, 1,3,5-7, 1-10:2 or 1-100%5`);
+  if (args.dependency != null && !RE_DEPENDENCY.test(String(args.dependency))) errs.push(`dependency "${args.dependency}" must look like afterok:12345, afterany:12345_1,afterok:67890 or singleton`);
   if (!Number.isInteger(args.gpus) || args.gpus < 0) errs.push(`gpus must be a non-negative integer`);
   if (args.cpus_per_task != null && (!Number.isInteger(args.cpus_per_task) || args.cpus_per_task < 0)) errs.push(`cpus_per_task must be a non-negative integer`);
   const odErr = validatePath(String(args.output_dir), 'output_dir') || (/['"\s]/.test(String(args.output_dir)) ? 'output_dir contains quotes or whitespace' : null);
@@ -1203,8 +1505,8 @@ server.tool('slurm_submit',
   'Chain jobs with `dependency` (e.g. "afterok:12345"). Checks past resource usage, and appends ⚠️ hints (non-blocking) when the partition has a per-user cap that will serialize your jobs or reject the request (gpus/mem/time over the cap).', {
   script: z.string().describe('Main command(s) to run inside the job'),
   job_name: z.string().optional().describe('Job name, [A-Za-z0-9_.-]{1,64} (default: slurm-job)'),
-  partition: z.string().optional().describe('Partition (default: batch). Use cluster_info to see per-user caps; small debug partitions often allow 1 job at a time — for parallel chunks pick a partition without a per-user cap.'),
-  gpus: z.number().optional().describe('Number of GPUs (default: 1). Some sites reject 0 (every job must request ≥1 GPU).'),
+  partition: z.string().optional().describe(`Partition (default: ${DEFAULT_PARTITION}). Use cluster_info to see per-user caps; small debug partitions often allow 1 job at a time — for parallel chunks pick a partition without a per-user cap.`),
+  gpus: z.number().optional().describe(`Number of GPUs (default: ${DEFAULT_GPUS}; 0 = no --gres line). Some sites reject 0 (every job must request ≥1 GPU).`),
   mem: z.string().optional().describe('Memory, e.g. 4G / 512M (default: 4G)'),
   time: z.string().optional().describe('Time limit: M, M:S, H:M:S, D-H, D-H:M or D-H:M:S (default: 00:15:00)'),
   cpus_per_task: z.number().optional(),
@@ -1215,7 +1517,7 @@ server.tool('slurm_submit',
   preamble: z.boolean().optional().default(true).describe('Include HPC_PREAMBLE (module loads/conda env) in the job script. Set false for generic jobs that do not need the project environment.'),
 }, async (rawArgs) => {
   // Defaults — template values override these, user explicit values override template
-  const DEFAULTS = { job_name: 'slurm-job', partition: 'batch', gpus: 1, mem: '4G', time: '00:15:00', output_dir: 'results/logs' };
+  const DEFAULTS = { job_name: 'slurm-job', partition: DEFAULT_PARTITION, gpus: DEFAULT_GPUS, mem: '4G', time: '00:15:00', output_dir: 'results/logs' };
   // Apply template, then user values, on top of defaults
   let tmplValues = {};
   let extraPreamble = null;
@@ -1235,6 +1537,8 @@ server.tool('slurm_submit',
     delete tmplValues.preamble;
   }
   const args = { ...DEFAULTS, ...tmplValues, ...Object.fromEntries(Object.entries(rawArgs).filter(([, v]) => v !== undefined)) };
+  // Normalize before validating so the validated string is the written one.
+  if (typeof args.time === 'string') args.time = args.time.trim();
 
   const argErrs = validateSubmitArgs(args);
   if (argErrs.length) {
@@ -1245,10 +1549,12 @@ server.tool('slurm_submit',
   // Auto-check resource history before submitting
   let resourceInfo = '';
   try {
-    const raw = queryResourceHistory(args.job_name);
-    const hist = parseResourceHistory(raw);
+    const rh = queryResourceHistory(args.job_name);
+    const hist = rh.status === 'ok' ? parseResourceHistory(rh.text) : null;
     if (hist) {
       resourceInfo = formatRecommendation(hist) + checkResourceWaste(args.mem, args.time, hist);
+    } else if (rh.status === 'error') {
+      resourceInfo = `\n⚠️ resource history unavailable: ${rh.reason}`;
     }
   } catch { /* non-fatal */ }
 
@@ -1280,9 +1586,11 @@ server.tool('slurm_submit',
       }
     }
     cdLine = `cd '${storedWorkdir}'`; // validated above: no quotes inside
-    // Auto-align output_dir to workdir when using default
-    if (args.output_dir === 'results/logs') {
-      outputDir = `${storedWorkdir}/results/logs`;
+    // Why absolute: sbatch resolves a relative --output against the submit
+    // cwd (the ssh login dir, $HOME), not the workdir — the `cd` in the script
+    // runs later. mkdir and --output must name the same directory.
+    if (!outputDir.startsWith('/')) {
+      outputDir = `${storedWorkdir.replace(/\/+$/, '')}/${outputDir}`;
     }
   } else {
     workdirHint = '\n💡 建议先用 workdir_set 设置工作目录，确保实验文件保存在正确位置';
@@ -1319,7 +1627,7 @@ server.tool('slurm_submit',
   if (sbatch.includes(eof)) {
     return { content: [{ type: 'text', text: 'Submit rejected: script/preamble contains the heredoc delimiter' }], isError: true };
   }
-  const mkdirTarget = outputDir.startsWith('/') ? outputDir : (storedWorkdir ? `${storedWorkdir}/${outputDir}` : outputDir);
+  const mkdirTarget = outputDir; // same path as #SBATCH --output (see above)
   // Computed before sbatch so the "other jobs in this partition" count does
   // not include the job we are about to submit.
   let limitHints = '';
@@ -1333,14 +1641,17 @@ server.tool('slurm_submit',
     if (jobMatch) {
       const jobId = jobMatch[1];
       const estSeconds = timeSec;
-      registerWatch(jobId, args.job_name, estSeconds, args.partition);
+      const watchErr = tryRegisterWatch(jobId, args.job_name, estSeconds, args.partition);
       const estMin = Math.round(estSeconds / 60);
       // No POLL_CMD suggestion: the built-in 30s batched watcher already
       // monitors this job and piggybacks a notification onto the next tool
       // result. Handing the client a 10s `while true; do ssh ...` loop
       // multiplies SSH traffic for nothing (connection-storm lesson, 2026-07-02).
       const arrayNote = args.array ? ` (array ${args.array}: notifies once ALL tasks finish, with an ok/failed tally)` : '';
-      return { content: [{ type: 'text', text: out + `\n👁️ Watch registered: job ${jobId}${arrayNote}, est. ${estMin}min — completion auto-notifies on the next tool call (or check slurm_watches). Do NOT poll with ssh loops.` + limitHints + resourceInfo + workdirHint }] };
+      const watchNote = watchErr
+        ? `\n⚠️ The job IS queued (do not resubmit), but watch registration failed: ${watchErr} — check it with slurm_status ${jobId}.`
+        : `\n👁️ Watch registered: job ${jobId}${arrayNote}, est. ${estMin}min — completion auto-notifies on the next tool call (or check slurm_watches). Do NOT poll with ssh loops.`;
+      return { content: [{ type: 'text', text: out + watchNote + limitHints + resourceInfo + workdirHint }] };
     }
     return { content: [{ type: 'text', text: out + limitHints + resourceInfo + workdirHint }] };
   } catch (e) {
@@ -1356,7 +1667,8 @@ server.tool('slurm_cancel', 'Cancel a SLURM job, a single array task, or a range
     const out = sshExec(`scancel '${jid}' && echo "Job ${jid} cancelled"`);
     // Only a whole-job cancel ends the watch; cancelling some array tasks
     // leaves the rest running and the watch reports them when all finish.
-    removeWatch(jid);
+    // Scoped to the active cluster: the same id may exist on another one.
+    try { removeWatch(jid, SSH_HOST); } catch (err) { logDebug(`removeWatch(${jid}) failed: ${err.message}`); }
     return { content: [{ type: 'text', text: out }] };
   } catch (e) {
     return { content: [{ type: 'text', text: `Cancel failed: ${String(e?.message ?? e)}` }], isError: true };
@@ -1372,17 +1684,35 @@ server.tool('slurm_logs', 'Read SLURM job output log. For array jobs pass one ta
     // Find the log file. sacct StdOut is empty on clusters whose accounting
     // doesn't store it (e.g. SMU SuperPOD, verified 2026-07-02) — fall back
     // to scontrol (recent/running jobs), then to the stored workdir's log dirs.
-    let stdoutPath = sshExec(`sacct -j '${jid}' --format=StdOut%-200 -P -n | head -1`, 10000).trim();
-    if (!stdoutPath || stdoutPath === '|') {
+    // A path is usable only if it is concrete: sacct may return the raw
+    // --output pattern with %j/%A/%a placeholders unexpanded.
+    const usable = (p) => !!p && p !== '|' && !p.includes('%');
+    const sacctPath = sshExec(`sacct -j '${jid}' --format=StdOut%-200 -P -n | head -1`, 10000).trim();
+    let stdoutPath = usable(sacctPath) ? sacctPath : '';
+    if (!stdoutPath) {
       try {
-        stdoutPath = sshExec(`scontrol show job '${jid}' 2>/dev/null | grep -o 'StdOut=[^ ]*' | cut -d= -f2`, 10000).trim();
-      } catch { stdoutPath = ''; }
+        const p = sshExec(`scontrol show job '${jid}' 2>/dev/null | grep -o 'StdOut=[^ ]*' | cut -d= -f2`, 10000).trim();
+        if (usable(p)) stdoutPath = p; // scontrol expands the placeholders
+      } catch { /* job no longer known to slurmctld */ }
+    }
+    if (!stdoutPath && sacctPath.includes('%')) {
+      stdoutPath = expandLogPattern(sacctPath, jid) || '';
+      if (stdoutPath) {
+        try {
+          stdoutPath = sshExec(`ls '${stdoutPath}' 2>/dev/null | head -1`, 10000).trim();
+        } catch { stdoutPath = ''; }
+      }
     }
     if (!stdoutPath) {
       const wd = loadWorkdir();
-      if (wd) {
+      if (wd && !validatePath(wd, 'workdir') && !/['"\s]/.test(wd)) {
+        // Array task "123_4": slurm_submit writes slurm_%A_%a.out = slurm_123_4.out.
+        const arr = jid.match(/^(\d+)_(\d+)$/);
+        const names = [`slurm_${jid}.out`, `slurm-${jid}.out`];
+        if (arr) names.push(`slurm_${arr[1]}_${arr[2]}.out`, `slurm-${arr[1]}_${arr[2]}.out`);
+        const candidates = [...new Set(names)].flatMap(n => [`${wd}/results/logs/${n}`, `${wd}/logs/${n}`, `${wd}/${n}`]);
         try {
-          stdoutPath = sshExec(`ls ${wd}/results/logs/slurm_${jid}.out ${wd}/logs/slurm_${jid}.out ${wd}/slurm_${jid}.out ${wd}/slurm-${jid}.out 2>/dev/null | head -1`, 10000).trim();
+          stdoutPath = sshExec(`ls ${candidates.map(c => `'${c}'`).join(' ')} 2>/dev/null | head -1`, 10000).trim();
         } catch { stdoutPath = ''; }
       }
     }
@@ -1400,6 +1730,27 @@ server.tool('slurm_logs', 'Read SLURM job output log. For array jobs pass one ta
     return { content: [{ type: 'text', text: `Log read failed: ${String(e?.message ?? e)}` }], isError: true };
   }
 });
+
+// Expand an sbatch --output pattern for a job id we know. Only placeholders
+// that are fully determined by the id are handled (%j for a plain job, %A/%a
+// for an array task, %%); anything else (%x, %N, %u, …) → null.
+function expandLogPattern(pattern, jid) {
+  const arr = String(jid).match(/^(\d+)_(\d+)$/);
+  const plain = /^\d+$/.test(jid) ? jid : null;
+  let failed = false;
+  const out = String(pattern).replace(/%(\d*)([%jAa])|%./g, (tok, width, ch) => {
+    if (!ch) { failed = true; return tok; }
+    if (ch === '%') return '%';
+    let v = null;
+    if (ch === 'j') v = plain;
+    else if (ch === 'A') v = arr ? arr[1] : null;
+    else if (ch === 'a') v = arr ? arr[2] : null;
+    if (v == null) { failed = true; return tok; }
+    return width ? v.padStart(+width, '0') : v;
+  });
+  if (failed || UNSAFE_PATH.test(out) || /['"]/.test(out)) return null;
+  return out;
+}
 
 server.tool('slurm_submit_file', 'Submit an existing .slurm/.sh script file on HPC', {
   path: z.string().describe('Absolute path to the .slurm/.sh file on HPC'),
@@ -1422,8 +1773,11 @@ server.tool('slurm_submit_file', 'Submit an existing .slurm/.sh script file on H
       // [\w.-]{1,64} shape slurm_submit enforces for job_name.
       const baseName = args.path.split('/').pop() || '';
       const jobName = RE_JOB_NAME.test(baseName) ? baseName : (baseName.replace(/[^\w.-]/g, '_').slice(0, 64) || 'script-job');
-      registerWatch(jobId, jobName, 3600, 'batch');
-      return { content: [{ type: 'text', text: `${out}\n👁️ Watch registered: job ${jobId}` }] };
+      const watchErr = tryRegisterWatch(jobId, jobName, 3600, DEFAULT_PARTITION);
+      const watchNote = watchErr
+        ? `\n⚠️ The job IS queued (do not resubmit), but watch registration failed: ${watchErr} — check it with slurm_status ${jobId}.`
+        : `\n👁️ Watch registered: job ${jobId}`;
+      return { content: [{ type: 'text', text: `${out}${watchNote}` }] };
     }
     return { content: [{ type: 'text', text: out }] };
   } catch (e) {
@@ -1462,10 +1816,13 @@ server.tool('cluster_info', 'Get HPC cluster partitions, queue load, your jobs, 
     try {
       const all = loadPartitionLimitsForHost();
       const rows = all.map(p =>
-        `${p.partition}: MaxTime=${p.maxTime ?? 'n/a'} MaxJobsPU=${p.maxJobsPU ?? 'none'}` +
-        (p.maxSubmitPU != null ? ` MaxSubmitPU=${p.maxSubmitPU}` : '') +
-        ` MaxTRESPU=${p.maxTRESPU || 'none'}` + (p.qos ? ` (QoS ${p.qos})` : ''));
-      limitsInfo = `\n\n=== Per-user limits ===\n${rows.join('\n')}`;
+        p.qosUnavailable
+        ? `${p.partition}: MaxTime=${p.maxTime ?? 'n/a'} (QoS limits unavailable)`
+        : `${p.partition}: MaxTime=${p.maxTime ?? 'n/a'} MaxJobsPU=${p.maxJobsPU ?? 'none'}` +
+          (p.maxSubmitPU != null ? ` MaxSubmitPU=${p.maxSubmitPU}` : '') +
+          ` MaxTRESPU=${p.maxTRESPU || 'none'}` + (p.qos ? ` (QoS ${p.qos})` : ''));
+      const qosNote = all.some(p => p.qosUnavailable) ? '\nQoS limits unavailable (sacctmgr query failed); per-user caps are not shown.' : '';
+      limitsInfo = `\n\n=== Per-user limits ===\n${rows.join('\n')}${qosNote}`;
     } catch (err) {
       limitsInfo = `\n\n=== Per-user limits ===\n(unavailable: ${String(err?.message ?? err).split('\n')[0]})`;
     }
@@ -1502,6 +1859,39 @@ server.tool('cluster_switch', 'Switch active HPC cluster (when multiple clusters
   return { content: [{ type: 'text', text: `Switched to cluster: ${switched}${warning}` }] };
 });
 
+// sacct rows "JobID|JobName|Partition|Elapsed|MaxRSS|ReqMem|ReqTRES|State"
+// → totals. Jobs are counted on their allocation row; peak memory is the max
+// MaxRSS over ALL rows of a job, because MaxRSS is only filled on the step
+// rows (.batch/.extern) — skipping steps made the peak always 0.
+function summarizeResourceReport(raw) {
+  const jobs = new Map();
+  for (const line of String(raw || '').split('\n')) {
+    if (!line.trim()) continue;
+    const parts = line.split('|').map(x => x.trim());
+    const id = parts[0] || '';
+    const key = id.split('.')[0];
+    if (!key) continue;
+    if (!jobs.has(key)) jobs.set(key, { main: null, rssMB: 0 });
+    const j = jobs.get(key);
+    if (!id.includes('.')) j.main = parts;
+    const rss = parseMemToMB(parts[4]);
+    if (rss != null) j.rssMB = Math.max(j.rssMB, rss);
+  }
+  let totalJobs = 0, completed = 0, failed = 0, totalTimeSec = 0, maxMB = 0, gpuJobs = 0;
+  for (const j of jobs.values()) {
+    if (!j.main) continue; // steps without their allocation row (outside the window)
+    const parts = j.main;
+    const state = baseState(parts[7]);
+    totalJobs++;
+    if (state === 'COMPLETED') completed++;
+    if (state === 'FAILED' || state === 'TIMEOUT' || state === 'OUT_OF_MEMORY') failed++;
+    totalTimeSec += parseElapsed(parts[3] || '');
+    maxMB = Math.max(maxMB, j.rssMB);
+    if ((parts[6] || '').includes('gpu')) gpuJobs++;
+  }
+  return { totalJobs, completed, failed, totalTimeSec, maxMemGB: maxMB / 1024, gpuJobs };
+}
+
 server.tool('resource_report', 'Summarize resource usage over a time period', {
   days: z.number().optional().default(7).describe('Number of days to look back (default 7)'),
   format: z.enum(['text', 'csv']).optional().default('text'),
@@ -1514,31 +1904,10 @@ server.tool('resource_report', 'Summarize resource usage over a time period', {
     if (!raw) return { content: [{ type: 'text', text: 'No jobs found in the specified period.' }] };
 
     const lines = raw.split('\n').filter(l => l.trim());
-    let totalJobs = 0, completed = 0, failed = 0;
-    let totalTimeSec = 0, maxMemGB = 0, gpuJobs = 0;
-
-    for (const line of lines) {
-      const parts = line.split('|');
-      const state = parts[7] || '';
-      if (parts[0]?.includes('.')) continue; // skip sub-steps
-      totalJobs++;
-      if (state === 'COMPLETED') completed++;
-      if (state === 'FAILED' || state === 'TIMEOUT' || state === 'OUT_OF_MEMORY') failed++;
-      // Parse elapsed
-      const elapsed = parts[3] || '';
-      const secs = parseElapsed(elapsed);
-      if (secs > 0) totalTimeSec += secs;
-      // Parse memory
-      const rss = parts[4] || '';
-      if (rss.endsWith('K')) maxMemGB = Math.max(maxMemGB, parseInt(rss) / 1024 / 1024);
-      else if (rss.endsWith('M')) maxMemGB = Math.max(maxMemGB, parseInt(rss) / 1024);
-      else if (rss.endsWith('G')) maxMemGB = Math.max(maxMemGB, parseFloat(rss));
-      // GPU
-      if ((parts[6] || '').includes('gpu')) gpuJobs++;
-    }
+    const s = summarizeResourceReport(raw);
+    const { totalJobs, completed, failed, totalTimeSec, maxMemGB, gpuJobs } = s;
 
     const totalH = (totalTimeSec / 3600).toFixed(1);
-    const gpuH = gpuJobs > 0 ? `${(totalTimeSec / 3600 * gpuJobs / totalJobs).toFixed(1)}h (estimated)` : 'N/A';
 
     if (args.format === 'csv') {
       return { content: [{ type: 'text', text: raw }] };
@@ -1564,14 +1933,7 @@ server.tool('resource_report', 'Summarize resource usage over a time period', {
 });
 
 // --- File Sync ---
-
-// Path validation: block shell metacharacters and traversal
-const UNSAFE_PATH = /[;|$()&<>`\n\t\r\\]/;
-function validatePath(p, label) {
-  if (UNSAFE_PATH.test(p)) return `${label} contains unsafe characters`;
-  if (p.includes('..')) return `${label} contains '..' (path traversal not allowed)`;
-  return null;
-}
+// (UNSAFE_PATH / validatePath are defined at the top: env validation uses them.)
 
 server.tool('sync_files', 'Sync files between local and HPC via rsync', {
   direction: z.enum(['upload', 'download']),
@@ -1658,7 +2020,7 @@ server.tool('terminal_send', 'Send keys to tmux session. No heredoc or multi-lin
   session: z.string().optional().default('hpc'),
   keys: z.string().describe('Keys to send (text or special: Enter, Ctrl-C, Tab). No heredoc (<<), no multi-line code.'),
 }, async (args) => {
-  if (/<<\s*['"]?\w+['"]?/.test(args.keys)) {
+  if (HEREDOC_RE.test(args.keys)) {
     return { content: [{ type: 'text', text: 'BLOCKED: heredoc not allowed via terminal_send. Write local file → sync_files upload.' }], isError: true };
   }
   if (args.keys.length > 500) {
@@ -1720,7 +2082,6 @@ server.tool('ssh_interactive', 'Start an interactive SSH session to HPC via tmux
 
     // Wait for SSH to connect
     await new Promise(r => setTimeout(r, 2000));
-    const initial = tmuxExec(['capture-pane', '-t', s, '-p', '-S', '-20']);
 
     // Run command if provided
     if (args.command) {
@@ -1818,7 +2179,9 @@ server.tool('slurm_watches', 'List active SLURM job watches and pending notifica
 // SLURM_MCP_NO_START=1: import for unit tests without starting the poller,
 // the stdin lifecycle hooks or the stdio transport (pure helpers only).
 if (process.env.SLURM_MCP_NO_START !== '1') {
-  // Start watch polling loop
+  // Liveness heartbeat on its own timer (independent of poll backoff), then
+  // the watch polling loop.
+  startHeartbeat();
   startWatchPolling();
 
   // Lifecycle: a stdio MCP server must die with its client. Without these, the
@@ -1843,5 +2206,7 @@ export {
   memToMB, parseTres, validateSubmitArgs, RE_JOB_NAME, RE_PARTITION, RE_MEM, RE_ARRAY, RE_DEPENDENCY,
   VALID_JOB_ID, validateJobId, validatePath, validateSession, UNSAFE_PATH,
   guardCommand, BLOCKED_PATTERNS, MAX_CMD_LENGTH, compressOutput,
-  atomicWriteJson, readJsonOrQuarantine, withFileLock,
+  atomicWriteJson, readJsonOrQuarantine, withFileLock, reclaimStaleLock,
+  aggregateSacctRows, isWatchExpired, isValidWatch, parseMemToMB, summarizeResourceReport,
+  expandLogPattern, safePoll, pollState,
 };

@@ -26,7 +26,13 @@ export HPC_USER=your-username       # Your cluster username
 export SLURM_ACCOUNT=your-account   # SLURM account/allocation
 # Optional:
 export HPC_PREAMBLE='module load python/3.11\nconda activate myenv'
+export SLURM_DEFAULT_PARTITION=batch  # default partition for slurm_submit
+export SLURM_DEFAULT_GPUS=1           # sites without GPUs: set SLURM_DEFAULT_GPUS=0
 ```
+
+`HPC_HOST`, `HPC_USER` and `SLURM_ACCOUNT` may only contain letters, digits,
+`_`, `.` and `-` (comma-separated for multiple clusters); the server exits at
+startup with an error otherwise.
 
 ### 2. Add to your MCP client
 
@@ -101,7 +107,7 @@ Add to `.cursor/mcp.json` in your project root:
 
 This is a standard MCP server using stdio transport. Configure it in your client with:
 - **Command**: `npx -y slurm-mcp-server`
-- **Environment variables**: `HPC_HOST`, `HPC_USER`, `SLURM_ACCOUNT` (required), `HPC_PREAMBLE`, `NOTIFY_WEBHOOK`, `HPC_RESOURCE_LOG`, `HPC_GUIDE_EXTRA` (optional)
+- **Environment variables**: `HPC_HOST`, `HPC_USER`, `SLURM_ACCOUNT` (required), `HPC_PREAMBLE`, `NOTIFY_WEBHOOK`, `HPC_RESOURCE_LOG`, `HPC_GUIDE_EXTRA`, `SLURM_DEFAULT_PARTITION`, `SLURM_DEFAULT_GPUS` (optional)
 </details>
 
 ### 3. Restart your client
@@ -111,10 +117,10 @@ That's it. SSH ControlMaster is recommended for persistent connections.
 ## Features
 
 ### 🖥️ TTY-Aware Job Watching
-Each terminal window tracks its own SLURM jobs independently. No cross-talk between windows. Automatic 30-second polling (one batched `sacct` per cluster) with state change detection. Watch TTL follows the job's own time limit, so multi-day jobs are never silently dropped. Array jobs are tracked per task and reported once all tasks reach a terminal state (`CANCELLED by <uid>`, `PREEMPTED`, `BOOT_FAIL`, `DEADLINE`, `REVOKED` included). Watch/notification/template state files are written atomically under a lock file, and a corrupt file is moved aside as `.corrupt-<ts>` instead of being overwritten.
+Each terminal window tracks its own SLURM jobs independently. No cross-talk between windows. Automatic 30-second polling (one batched `sacct` per cluster) with state change detection. A watch stays alive as long as `sacct` still reports the job (long queue waits included); it only expires after max(48h, 4 × the time limit) without being seen. Watches are keyed by cluster + job id, so the same id on two clusters never collides. Array jobs are tracked per task and reported once all tasks reach a terminal state (`CANCELLED by <uid>`, `PREEMPTED`, `BOOT_FAIL`, `DEADLINE`, `REVOKED` included). Watch/notification/template state files are written atomically under a lock file, and a corrupt file is moved aside as `.corrupt-<ts>` instead of being overwritten.
 
 ### 👪 Orphan Watch Adoption
-Every poller writes a heartbeat; when a session dies, its watches are adopted by any live instance and keep being monitored. Pending notifications from closed sessions are surfaced (and drained) by whichever session runs next — long jobs never complete silently.
+Every server writes a heartbeat every 30s on its own timer (independent of poll backoff); when a session dies, its watches are adopted by any live instance and keep being monitored. Pending notifications from closed sessions are surfaced (and drained) by whichever session runs next — long jobs never complete silently.
 
 ### 🛡️ Command Guard
 Blocks 8 patterns of SSH escape traps that silently corrupt commands, plus a length limit:
@@ -130,7 +136,7 @@ Job completion triggers native desktop notifications:
 - **Linux**: `notify-send`
 
 ### 📊 Resource Check
-Before submitting jobs, automatically queries `sacct` for historical resource usage of similar jobs. Warns when requested resources exceed 10× actual usage.
+Before submitting jobs, automatically queries `sacct` for historical resource usage of similar jobs (peak `MaxRSS` over all job steps, elapsed time). Warns when requested resources exceed 10× actual usage. An ssh/sacct failure is reported as "resource history unavailable: <reason>", distinct from "no history yet".
 
 ### 📁 Workdir Guard
 Per-window working directory tracking prevents accidentally submitting jobs to wrong directories.
@@ -201,6 +207,8 @@ Start a tmux-based interactive SSH session for commands needing 2FA, confirmatio
 | `NOTIFY_WEBHOOK` | ❌ | Slack/Discord webhook URL for job completion alerts |
 | `HPC_RESOURCE_LOG` | ❌ | Path **on the cluster** to an extra resource log (e.g. TSV of past runs) that `resource_check` greps by job name |
 | `HPC_GUIDE_EXTRA` | ❌ | Local path to a site-specific guide appended to the `guide` tool output (accounts, partition policy, envs) |
+| `SLURM_DEFAULT_PARTITION` | ❌ | Default `partition` for `slurm_submit` (default `batch`) |
+| `SLURM_DEFAULT_GPUS` | ❌ | Default `gpus` for `slurm_submit` (default `1`). Sites without GPUs: set `SLURM_DEFAULT_GPUS=0` (no `--gres` line) |
 
 ## SSH Setup
 
@@ -216,6 +224,13 @@ Host mycluster
 ```
 
 Create the socket directory: `mkdir -p ~/.ssh/sockets`
+
+## Known limitations
+
+- **Synchronous ssh calls block the event loop.** Tool handlers use `execFileSync`, so while one remote command runs (up to its timeout, max 10 min for `ssh_exec`), the server handles no other request and the poller waits. Moving to async execution is planned.
+- **Windows clients are not supported.** Local paths (`sync_files`, state files under `~/.claude`), the tty detection and the ControlMaster checks assume a POSIX client (macOS / Linux).
+- **The Command Guard is not a security boundary.** It only catches quoting mistakes that break the `bash --login -c '...'` transport; `ssh_exec` runs arbitrary commands as your cluster user.
+- **Association-level QoS limits are not shown.** `cluster_info` and the submit hints read partition `MaxTime` and the partition QoS (`sacctmgr show qos`); limits set on your user/account association are not queried.
 
 ## License
 

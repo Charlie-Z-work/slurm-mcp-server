@@ -5,6 +5,16 @@
 //
 // Scenarios ($FAKE_SCENARIO): normal (default) | array | cancelled_by |
 // master_dead | sbatch_fail.
+// Extra knobs (env, all optional):
+//   FAKE_DEAD_HOSTS=a,b         `ssh -O check <host>` fails for these hosts
+//   FAKE_RESOURCE_HISTORY=rows|fail   resource-history sacct queries return
+//                               real-shaped rows (MaxRSS only on step rows) or fail
+//   FAKE_STDOUT=placeholder|empty     sacct StdOut returns an unexpanded
+//                               "%j" pattern / nothing
+//   FAKE_SCONTROL_STDOUT=<path> scontrol show job reports this StdOut
+//   FAKE_LS_EXISTS=<path>       `ls` of candidate log paths finds only this one
+//   FAKE_SQUEUE_FAIL=1          `squeue -j` fails like for a finished job
+//   FAKE_SACCTMGR_FAIL=1        sacctmgr fails (slurmdbd unreachable)
 // Array state machine: sacct reports task 2 RUNNING until either the file named
 // by $FAKE_ARRAY_GATE exists (deterministic mode for tests) or, when no gate is
 // set, until the second sacct poll.
@@ -31,7 +41,9 @@ const oi = argv.indexOf('-O');
 if (oi >= 0) {
   const op = argv[oi + 1];
   log({ kind: 'control', op });
-  if (scenario === 'master_dead') {
+  const host = argv[oi + 2];
+  const dead = (process.env.FAKE_DEAD_HOSTS || '').split(',').filter(Boolean);
+  if (scenario === 'master_dead' || dead.includes(host)) {
     out('', 255, 'Control socket connect(/tmp/cm-fake): No such file or directory');
   }
   out('', 0, 'Master running (pid=1)');
@@ -92,10 +104,44 @@ if (/\|\s*sbatch\b/.test(cmd) || /^sbatch\s/.test(cmd)) {
   out(`Submitted batch job ${JOB_IDS[scenario] || '541806'}`);
 } else if ((r = cmd.match(/^sacct -j ([\d,]+) --format=JobID%-20,State -P -n$/))) {
   out(sacctPollRows(r[1].split(',')));
-} else if (/^sacct -u /.test(cmd)) {
-  out('', 1); // resource history: `| grep COMPLETED` matched nothing
+} else if (/^sacct -u \S+ -X /.test(cmd)) {
+  // resource history step 1: recent allocations of this user
+  const rh = process.env.FAKE_RESOURCE_HISTORY;
+  if (rh === 'fail') out('', 1, 'sacct: error: Problem talking to the database: Connection refused');
+  if (rh === 'rows') {
+    out(['541700|other|COMPLETED', '541806|train|COMPLETED', '541807|Train-big|COMPLETED',
+      '541808|train|FAILED', '541809_1|train|COMPLETED'].join('\n'));
+  }
+  out('');
+} else if ((r = cmd.match(/^sacct -j ([\d_,]+) -o JobID%-20,JobName%-20,Elapsed,MaxRSS,ReqMem,State -P -n$/))) {
+  // resource history step 2: every row incl. steps. As on the real cluster,
+  // the allocation row has an empty MaxRSS; only steps carry it.
+  if (process.env.FAKE_RESOURCE_HISTORY === 'fail') out('', 1, 'sacct: error: Problem talking to the database: Connection refused');
+  const rows = {
+    541806: ['541806|train|00:10:00||4G|COMPLETED', '541806.batch|batch|00:10:00|1.50G||COMPLETED', '541806.extern|extern|00:10:00|1024K||COMPLETED'],
+    541807: ['541807|Train-big|01:00:00||8G|COMPLETED', '541807.batch|batch|01:00:00|3G||COMPLETED', '541807.extern|extern|01:00:00|0||COMPLETED'],
+    '541809_1': ['541809_1|train|00:05:00||4G|COMPLETED', '541809_1.batch|batch|00:05:00|512M||COMPLETED'],
+  };
+  out(r[1].split(',').flatMap(id => rows[id] || []).join('\n'));
 } else if ((r = cmd.match(/^sacct -j '([^']+)' --format=StdOut/))) {
+  if (process.env.FAKE_STDOUT === 'placeholder') out('/home/u/proj/results/logs/slurm_%j.out');
+  if (process.env.FAKE_STDOUT === 'empty') out('');
   out(`/home/u/proj/results/logs/slurm_${r[1]}.out`);
+} else if (/^scontrol show job '/.test(cmd)) {
+  out(process.env.FAKE_SCONTROL_STDOUT || '');
+} else if (/^squeue -j /.test(cmd) && process.env.FAKE_SQUEUE_FAIL === '1') {
+  out('', 1, 'slurm_load_jobs error: Invalid job id specified');
+} else if (/^sacctmgr /.test(cmd) && process.env.FAKE_SACCTMGR_FAIL === '1') {
+  out('', 1, 'sacctmgr: error: Problem talking to the database: Connection refused');
+} else if ((r = cmd.match(/^grep -iF -e (\S+) (\S+); test \$\? -le 1$/))) {
+  // HPC_RESOURCE_LOG lookup: grep exit 2 (missing file) makes the command fail.
+  if (/missing/.test(r[2])) out('', 1, `grep: ${r[2]}: No such file or directory`);
+  out(`${r[1]}\t2.1G\t00:12:00\tseed=1`);
+} else if (/^ls '/.test(cmd) && /slurm[_-]/.test(cmd)) {
+  // log-file lookup: `ls '<cand1>' '<cand2>' ... 2>/dev/null | head -1`
+  const want = process.env.FAKE_LS_EXISTS;
+  const cands = [...cmd.matchAll(/'([^']+)'/g)].map(x => x[1]);
+  out(want && cands.includes(want) ? want : '');
 } else if ((r = cmd.match(/^sacct -j '([^']+)'$/))) {
   out(['JobID           JobName  Partition    Account  AllocCPUS      State ExitCode',
     '------------ ---------- ---------- ---------- ---------- ---------- --------',
@@ -120,7 +166,7 @@ if (/\|\s*sbatch\b/.test(cmd) || /^sbatch\s/.test(cmd)) {
   out(r[2]);
 } else if (/^(tail|head) -n \d+ '/.test(cmd) || /^cat '/.test(cmd)) {
   out('epoch 1 loss 0.9\nepoch 2 loss 0.5');
-} else if (/^ls\b/.test(cmd)) {
+} else if (/^ls\b/.test(cmd) || /(&&|;)\s*ls\b/.test(cmd)) {
   out('a.txt\nb.txt');
 } else {
   out(''); // mkdir, cd, rm, ...: silent success

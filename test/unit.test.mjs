@@ -1,11 +1,11 @@
 // Unit tests for the pure helpers in index.mjs. Importing index.mjs with
 // SLURM_MCP_NO_START=1 registers the tools but starts no poller, stdin hooks
 // or transport. No network, no real ssh.
-// `test.todo` entries tagged BUG-<n> encode the intended behavior for known
-// bugs (see CHANGELOG "Known issues"); they report as todo until fixed.
+// Tests tagged BUG-<n> / B<n> are regression tests for the round-2 fixes
+// (see CHANGELOG, Unreleased → Fixed).
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, mkdirSync, utimesSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, mkdirSync, utimesSync, statSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -47,8 +47,23 @@ describe('parseSacctJobId', () => {
   for (const bad of ['', 'JobID', 'abc', '541806_x', '12345;rm']) {
     test(`rejects ${JSON.stringify(bad)}`, () => assert.equal(M.parseSacctJobId(bad), null));
   }
-  test.todo('heterogeneous job ids "12345+0" are not recognised (BUG-6)', () => {
-    assert.deepEqual(M.parseSacctJobId('12345+0'), { baseId: '12345', taskKey: null });
+  test('heterogeneous job ids "12345+0" fold into the base id (BUG-6)', () => {
+    assert.deepEqual(M.parseSacctJobId('12345+0'), { baseId: '12345', taskKey: null, het: '0' });
+    assert.deepEqual(M.parseSacctJobId('12345+1.batch'), { baseId: '12345', taskKey: null, het: '1' });
+    assert.equal(M.parseSacctJobId('12345+x'), null);
+  });
+  test('hetjob completes only when every component is terminal; verdict = first non-COMPLETED (BUG-6)', () => {
+    const run = M.aggregateSacctRows('12345+0|COMPLETED\n12345+0.batch|COMPLETED\n12345+1|RUNNING\n12345+1.batch|RUNNING');
+    const r = M.summarizeJobRows(run.get('12345'));
+    assert.deepEqual([r.allDone, r.isArray, r.isHet, r.running], [false, false, true, true]);
+    const done = M.summarizeJobRows(M.aggregateSacctRows('12345+0|COMPLETED\n12345+0.batch|COMPLETED\n12345+1|FAILED\n12345+1.batch|FAILED').get('12345'));
+    assert.deepEqual([done.allDone, done.isArray, done.verdict], [true, false, 'FAILED']);
+  });
+  test('aggregateSacctRows groups by base id, allocation row wins over steps', () => {
+    const m = M.aggregateSacctRows('541806|COMPLETED\n541806.batch|FAILED\n541822_1|RUNNING\n541822_[2-3]|PENDING\n\ngarbage|X\n');
+    assert.deepEqual([...m.keys()], ['541806', '541822']);
+    assert.deepEqual([...m.get('541806')], [[null, 'COMPLETED']]);
+    assert.deepEqual([...m.get('541822')], [['1', 'RUNNING'], ['[2-3]', 'PENDING']]);
   });
 });
 
@@ -146,15 +161,21 @@ describe('validateSubmitArgs', () => {
       assert.match(e[0], new RegExp(field), 'error names the offending field');
     });
   }
-  test.todo('dependency "afterok" without a job id is accepted; sbatch rejects it (BUG-9)', () => {
-    assert.notDeepEqual(errs({ dependency: 'afterok' }), []);
+  test('dependency after* without a job id is rejected; singleton takes no id (BUG-9)', () => {
+    for (const d of ['afterok', 'afterany', 'afterok:', 'afterok:1,afterany', 'singleton:123']) {
+      assert.equal(errs({ dependency: d }).length, 1, d);
+    }
+    for (const d of ['afterok:1:2', 'afterok:1,singleton', 'singleton,afterany:5_2']) {
+      assert.deepEqual(errs({ dependency: d }), [], d);
+    }
   });
-  test.todo('array step syntax "1-10:2" (valid SLURM) is rejected (BUG-10)', () => {
-    assert.deepEqual(errs({ array: '1-10:2' }), []);
+  test('array step syntax "1-10:2" (valid SLURM) is accepted (BUG-10)', () => {
+    for (const a of ['1-10:2', '1-10:2%3', '1,5-9:2', '0-100:10%5']) assert.deepEqual(errs({ array: a }), [], a);
+    for (const a of ['1:2', '1-10:', '1-10:2:3']) assert.equal(errs({ array: a }).length, 1, a);
   });
   test('collects every error at once', () => assert.equal(errs({ job_name: 'a b', mem: 'x', time: 'y' }).length, 3));
-  test.todo('time is validated after trim() but written untrimmed into #SBATCH (BUG-7)', () => {
-    assert.notDeepEqual(errs({ time: '10\n' }), []);
+  test('time with surrounding whitespace is rejected: validated string = written string (BUG-7)', () => {
+    for (const t of ['10\n', ' 10 ', '00:15:00 ']) assert.equal(errs({ time: t }).length, 1, JSON.stringify(t));
   });
 });
 
@@ -202,11 +223,20 @@ describe('guardCommand', () => {
     assert.equal(M.guardCommand('x'.repeat(M.MAX_CMD_LENGTH)), null);
     assert.match(M.guardCommand('x'.repeat(M.MAX_CMD_LENGTH + 1)), /超过 500/);
   });
-  test.todo('3-line commands pass the ">2 lines" rule (BUG-3)', () => {
-    assert.notEqual(M.guardCommand('a\nb\nc'), null);
+  test('3-line commands are blocked by the ">2 lines" rule (BUG-3)', () => {
+    assert.equal(M.guardCommand('a\nb\nc'), `BLOCKED: ${M.BLOCKED_PATTERNS[2].reason}`);
+    assert.equal(M.guardCommand('a\n\nc'), `BLOCKED: ${M.BLOCKED_PATTERNS[2].reason}`);
+    assert.equal(M.guardCommand('a\nb\n'), null, 'a trailing newline is not a third line');
   });
-  test.todo('"<<-EOF" heredoc bypasses the heredoc rule (BUG-4)', () => {
-    assert.notEqual(M.guardCommand('cat <<-X > f'), null);
+  test('"<<-EOF" heredoc is blocked by the heredoc rule (BUG-4)', () => {
+    assert.equal(M.guardCommand('cat <<-X > f'), `BLOCKED: ${M.BLOCKED_PATTERNS[0].reason}`);
+    assert.equal(M.guardCommand('cat <<- X > f'), `BLOCKED: ${M.BLOCKED_PATTERNS[0].reason}`);
+  });
+  test('python -c variants are blocked (BUG-4)', () => {
+    for (const c of ['python3.11 -c import\\ os', 'python -u -c import\\ os', 'python -uc x', 'python3 -B -c x', '/usr/bin/python3 -c x']) {
+      assert.equal(M.guardCommand(c), `BLOCKED: ${M.BLOCKED_PATTERNS[1].reason}`, c);
+    }
+    for (const c of ['python3.11 train.py -c cfg', 'python -u train.py', 'python -m pip list']) assert.equal(M.guardCommand(c), null, c);
   });
 });
 
@@ -223,8 +253,13 @@ describe('compressOutput', () => {
     const out = Array.from({ length: 40 }, (_, i) => `l${i}`).join('\n');
     assert.equal(M.compressOutput('python train.py', out), out);
   });
-  test.todo('"cd dir && python run.py" output is cut to its first line (BUG-2)', () => {
-    assert.equal(M.compressOutput('cd /w && python run.py', 'epoch 1\nepoch 2\ndone'), 'epoch 1\nepoch 2\ndone');
+  test('compound commands starting with a quiet verb keep full output (BUG-2)', () => {
+    const out = 'epoch 1\nepoch 2\ndone';
+    for (const c of ['cd /w && python run.py', 'source env.sh; python run.py', 'mkdir -p x && ls x', 'module load cuda | tee log']) {
+      assert.equal(M.compressOutput(c, out), out, c);
+    }
+    const long = Array.from({ length: 40 }, (_, i) => `l${i}`).join('\n');
+    assert.equal(M.compressOutput('echo start && python train.py', long), long, 'compound nav-prefixed command untouched');
   });
 });
 
@@ -251,8 +286,16 @@ describe('parseElapsed / parseResourceHistory / formatRecommendation', () => {
     assert.equal(M.parseResourceHistory(''), null);
     assert.equal(M.parseResourceHistory('1|x|00:01:00||4G|FAILED'), null);
   });
-  test.todo('count includes .batch/.extern step rows, inflating "N recent jobs" (BUG-8)', () => {
+  test('count is distinct jobs, not .batch/.extern step rows (BUG-8)', () => {
     assert.equal(M.parseResourceHistory(sacct).count, 2);
+  });
+  test('real-shaped rows: MaxRSS only on steps, decimals and T units (B7/B8)', () => {
+    const h = M.parseResourceHistory([
+      '600|train|00:10:00||4G|COMPLETED', '600.batch|batch|00:10:00|1.50G||COMPLETED', '600.extern|extern|00:10:00|1024K||COMPLETED',
+      '601_2|train|00:02:00||4G|COMPLETED', '601_2.batch|batch|00:02:00|0.5T||COMPLETED',
+      '602|train|00:01:00||4G|CANCELLED by 1', '602.batch|batch|00:01:00|900G||CANCELLED',
+    ].join('\n'));
+    assert.deepEqual(h, { maxMemGB: 512, maxTimeSec: 600, count: 2 });
   });
   test('formatRecommendation: ×3 mem, ×4 time', () => {
     const r = M.formatRecommendation({ maxMemGB: 1.1457, maxTimeSec: 600, count: 2 });
@@ -281,6 +324,76 @@ describe('checkResourceWaste', () => {
     assert.equal(M.checkResourceWaste('400G', '2-00:00:00', { maxMemGB: 0, maxTimeSec: 1 }), '');
   });
   test('memToMB', () => assert.deepEqual([M.memToMB('256G'), M.memToMB('2G'), M.memToMB('4096'), M.memToMB('1T'), M.memToMB('x')], [262144, 2048, 4096, 1048576, null]));
+});
+
+describe('parseMemToMB / summarizeResourceReport (B8)', () => {
+  const cases = [['1201368K', 1201368 / 1024], ['1.5M', 1.5], ['2.25G', 2304], ['2T', 2 * 1024 * 1024], ['1P', 1024 ** 3],
+    ['1048576', 1], ['0', 0], ['4Gn', 4096], ['500Mc', 500], ['4GB', 4096], ['4GiB', 4096]];
+  for (const [s, v] of cases) test(`parseMemToMB(${s}) = ${v}`, () => assert.ok(Math.abs(M.parseMemToMB(s) - v) < 1e-9, String(M.parseMemToMB(s))));
+  for (const bad of ['', null, undefined, 'x', '1.2.3G', '-1K', '4X']) test(`parseMemToMB(${JSON.stringify(bad)}) = null`, () => assert.equal(M.parseMemToMB(bad), null));
+  test('bare number is bytes for sacct, MB for requests', () => {
+    assert.equal(M.parseMemToMB('2048'), 2048 / 1024 / 1024);
+    assert.equal(M.parseMemToMB('2048', 'M'), 2048);
+  });
+  test('resource_report aggregation: peak memory comes from step rows', () => {
+    const raw = [
+      '700|a|batch|00:10:00||4G|billing=1,gres/gpu=1|COMPLETED',
+      '700.batch|batch||00:10:00|2.5G|||COMPLETED',
+      '700.extern|extern||00:10:00|1K|||COMPLETED',
+      '701|b|batch|01:00:00||4G|billing=1|FAILED',
+      '701.batch|batch||01:00:00|7T|||FAILED',
+      '702.batch|batch||00:01:00|99T|||COMPLETED', // step without allocation row: ignored
+    ].join('\n');
+    const s = M.summarizeResourceReport(raw);
+    assert.deepEqual(s, { totalJobs: 2, completed: 1, failed: 1, totalTimeSec: 4200, maxMemGB: 7 * 1024, gpuJobs: 1 });
+  });
+});
+
+describe('watch file hygiene (BUG-5, B5)', () => {
+  const H = 3600 * 1000;
+  const now = Date.parse('2026-09-27T12:00:00Z');
+  const iso = (ms) => new Date(ms).toISOString();
+  test('isValidWatch rejects null / non-objects / bad jobId / bad host', () => {
+    for (const w of [null, 1, 'x', [], {}, { jobId: 5 }, { jobId: '5;rm' }, { jobId: '5', host: '' }, { jobId: '5', host: 3 }]) {
+      assert.equal(M.isValidWatch(w), false, JSON.stringify(w));
+    }
+    assert.equal(M.isValidWatch({ jobId: '541806' }), true);
+    assert.equal(M.isValidWatch({ jobId: '541806', host: 'mp' }), true);
+  });
+  test('a long-queued job that sacct still reports never expires', () => {
+    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 30 * 24 * H), lastSeenAt: iso(now - 1 * H), estimatedSeconds: 900 }, now), false);
+  });
+  test('expires after max(48h, 4×estimate) without being seen', () => {
+    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 49 * H), estimatedSeconds: 900 }, now), true);
+    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 47 * H), estimatedSeconds: 900 }, now), false);
+    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 30 * 24 * H), lastSeenAt: iso(now - 49 * H), estimatedSeconds: 900 }, now), true);
+    // 2-day time limit → 8-day TTL
+    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 7 * 24 * H), estimatedSeconds: 2 * 86400 }, now), false);
+    assert.equal(M.isWatchExpired({ submittedAt: iso(now - 9 * 24 * H), estimatedSeconds: 2 * 86400 }, now), true);
+  });
+});
+
+describe('expandLogPattern (B10)', () => {
+  test('expands %j for a plain id and %A/%a for an array task', () => {
+    assert.equal(M.expandLogPattern('/w/logs/slurm_%j.out', '541806'), '/w/logs/slurm_541806.out');
+    assert.equal(M.expandLogPattern('/w/logs/slurm_%A_%a.out', '541822_4'), '/w/logs/slurm_541822_4.out');
+    assert.equal(M.expandLogPattern('/w/%5a/x%%.out', '9_3'), '/w/00003/x%.out');
+  });
+  test('placeholders not determined by the id → null', () => {
+    assert.equal(M.expandLogPattern('/w/slurm_%j.out', '541822_4'), null, '%j of an array task is its own id');
+    assert.equal(M.expandLogPattern('/w/%x_%j.out', '541806'), null);
+    assert.equal(M.expandLogPattern('/w/slurm_%A.out', '541806'), null);
+  });
+});
+
+describe('safePoll (B3)', () => {
+  test('a throwing poll cycle is recorded, counted and does not reject', async () => {
+    const before = M.pollState().consecutivePollFailures;
+    await M.safePoll(async () => { throw new Error('boom from poll'); });
+    const st = M.pollState();
+    assert.match(st.lastPollError, /poll cycle crashed: boom from poll/);
+    assert.equal(st.consecutivePollFailures, before + 1);
+  });
 });
 
 describe('atomicWriteJson / readJsonOrQuarantine', () => {
@@ -345,6 +458,32 @@ describe('withFileLock', () => {
     const dt = Date.now() - t0;
     assert.ok(dt >= 1900 && dt < 5000, `waited ${dt}ms`);
     assert.equal(existsSync(`${p}.lock`), true);
+  });
+  test('stale reclaim renames atomically and leaves no .stale- dirs (BUG-11)', () => {
+    const p = join(dir, 'e.json');
+    mkdirSync(`${p}.lock`);
+    const old = (Date.now() - 60_000) / 1000;
+    utimesSync(`${p}.lock`, old, old);
+    assert.equal(M.withFileLock(p, () => 'ran'), 'ran');
+    assert.deepEqual(readdirSync(dir).filter(f => f.startsWith('e.json')), []);
+  });
+  test('reclaim decided on an old stat never steals a fresh lock (BUG-11 race)', () => {
+    const p = join(dir, 'f.json');
+    const lockDir = `${p}.lock`;
+    mkdirSync(lockDir);
+    const old = (Date.now() - 60_000) / 1000;
+    utimesSync(lockDir, old, old);
+    const staleStat = statSync(lockDir);
+    // Another waiter reclaims the stale lock and takes a fresh one meanwhile.
+    const winnerAside = M.reclaimStaleLock(lockDir, staleStat);
+    assert.ok(winnerAside, 'first reclaimer wins');
+    mkdirSync(lockDir); // winner's fresh lock (aside still exists, so a new inode)
+    // The slower waiter acts on its stale observation: must not remove it.
+    assert.equal(M.reclaimStaleLock(lockDir, staleStat), null);
+    assert.equal(existsSync(lockDir), true, 'fresh lock survives');
+    assert.ok(Date.now() - statSync(lockDir).mtimeMs < 10_000, 'still the fresh lock');
+    assert.deepEqual(readdirSync(dir).filter(f => f.startsWith('f.json.lock.stale-') && join(dir, f) !== winnerAside), []);
+    rmdirSync(winnerAside); rmdirSync(lockDir);
   });
   test('two processes doing read-modify-write never lose an update', async () => {
     const p = join(dir, 'counter.json');

@@ -62,7 +62,7 @@ function shq(s) {
 // Path validation: block shell metacharacters and traversal
 const UNSAFE_PATH = /[;|$()&<>`\n\t\r\\]/;
 // remote_path for rsync: strict allowlist (see sync_files); a leading ~ is allowed.
-const RE_REMOTE_PATH = /^(?!$)~?[\w.\/+@-]*$/; // non-empty; bare ~ allowed
+const RE_REMOTE_PATH = /^(?!$)~?[\p{L}\p{N}_.\/+@:-]*$/u; // non-empty; bare ~ allowed; any script's letters/digits
 function validatePath(p, label) {
   if (UNSAFE_PATH.test(p)) return `${label} contains unsafe characters`;
   if (p.includes('..')) return `${label} contains '..' (path traversal not allowed)`;
@@ -2549,7 +2549,7 @@ server.tool('sync_files', 'Sync files between local and HPC via rsync', {
   // `--delete` would then prune the wrong directory (final-review finding).
   const remoteErr = validatePath(args.remote_path, 'remote_path')
     || (/\s/.test(args.remote_path) ? 'remote_path contains whitespace' : null)
-    || (!RE_REMOTE_PATH.test(args.remote_path) ? 'remote_path may only contain letters, digits, and . / _ - + @ ~ (no quotes or glob characters)' : null);
+    || (!RE_REMOTE_PATH.test(args.remote_path) ? 'remote_path may only contain letters, digits, and . / _ - + @ : ~ (no quotes, spaces or glob characters)' : null);
   if (remoteErr) return { content: [{ type: 'text', text: remoteErr }], isError: true };
   const localPath = expandLocalHome(args.local_path);
   if (!localPath.startsWith('/')) {

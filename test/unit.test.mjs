@@ -1003,7 +1003,7 @@ describe('remote_path allowlist (final review)', () => {
     for (const bad of ['/data/""', "/data/'x'", '/data/*', '/data/?.txt', '/data/[ab]', '/data/{a,b}', '/data/$HOME', '/data/a;b']) {
       assert.equal(M.RE_REMOTE_PATH.test(bad), false, bad);
     }
-    for (const ok of ['~/proj/run-1', '/users/u/dir.v2/file+x@y', '~', '/scratch/a_b']) {
+    for (const ok of ['~/proj/run-1', '/users/u/dir.v2/file+x@y', '~', '/scratch/a_b', '/data/实验/run:01', '/données/été']) {
       assert.equal(M.RE_REMOTE_PATH.test(ok), true, ok);
     }
   });

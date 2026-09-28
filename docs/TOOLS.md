@@ -135,13 +135,14 @@ Only a whole-job cancel removes the watch; cancelling some array tasks keeps wat
 ---
 
 ### slurm_logs
-Read a job's output log (sacct `StdOut` → `scontrol` → workdir log dirs fallback). A sacct path with unexpanded `%j`/`%A`/`%a` placeholders is not used as-is: `scontrol` is asked first, then the placeholders are expanded from the job id when possible, then `<workdir>/{results/logs,logs,.}/slurm_<id>.out` (arrays: `slurm_<A>_<a>.out`) are searched.
+Read a job's output log (explicit `path` → remembered `--output` pattern → sacct `StdOut` → `scontrol` → workdir log dirs fallback). `slurm_submit` / `slurm_submit_file` remember the `--output` pattern of every job they submit (`~/.claude/slurm-outputs.json`, last 500 jobs), so logs of finished jobs in a custom `output_dir` are found even where sacct stores no `StdOut`. A sacct path with unexpanded `%j`/`%A`/`%a` placeholders is not used as-is: `scontrol` is asked first, then the placeholders are expanded from the job id when possible, then `<workdir>/{results/logs,logs,.}/slurm_<id>.out` (arrays: `slurm_<A>_<a>.out`) are searched.
 
 **Parameters:**
 | Name | Type | Required | Default | Description |
 |------|------|:---:|---------|-------------|
 | job_id | string | ✅ | — | Job ID; for arrays pass one task, e.g. `12345_3` |
 | lines | number | ❌ | 50 | Lines to read from the end (0 = all) |
+| path | string | ❌ | — | Log file path on the cluster; skips the lookup (e.g. a job submitted outside this server) |
 
 ---
 

@@ -1008,3 +1008,82 @@ describe('remote_path allowlist (final review)', () => {
     }
   });
 });
+
+// ---- Live experiment fixes (D1-D3) ----
+
+describe('array progress denominator (D2)', () => {
+  test('range row + split-out task rows: each task counted once (total 9, done 4)', () => {
+    const rows = ['542124_[5-9]|PENDING', '542124_5|RUNNING',
+      '542124_1|COMPLETED', '542124_2|COMPLETED', '542124_3|COMPLETED', '542124_4|COMPLETED'].join('\n');
+    const s = M.summarizeJobRows(M.aggregateSacctRows(rows).get('542124'));
+    assert.equal(s.total, 9);
+    assert.equal(s.ok + s.failed, 4);
+    assert.equal(s.allDone, false);
+    assert.equal(s.running, true);
+  });
+  test('comma/step ranges are expanded before the difference', () => {
+    const t = M.aggregateSacctRows('9_[1,3,5-9:2]|PENDING\n9_3|RUNNING\n9_7|COMPLETED\n9_2|COMPLETED').get('9');
+    assert.deepEqual([...M.unitWeights(t)], [['[1,3,5-9:2]', 3], ['3', 1], ['7', 1], ['2', 1]]);
+    assert.equal(M.summarizeJobRows(t).total, 6);
+  });
+  test('a range fully covered by task rows is ignored for the verdict and the tally', () => {
+    const t = M.aggregateSacctRows('7_[1-2]|PENDING\n7_1|COMPLETED\n7_2|FAILED').get('7');
+    const s = M.summarizeJobRows(t);
+    assert.deepEqual([s.allDone, s.ok, s.failed, s.total], [true, 1, 1, 2]);
+  });
+  test('unknown range shapes still count as 1; plain jobs unchanged', () => {
+    assert.equal(M.taskKeyRanges('[x]'), null);
+    assert.equal(M.summarizeJobRows(new Map([['[x]', 'PENDING']])).total, 1);
+    assert.equal(M.summarizeJobRows(M.aggregateSacctRows('5|COMPLETED\n5.batch|COMPLETED').get('5')).total, 1);
+  });
+});
+
+describe('briefSshError (D3)', () => {
+  test('keeps the remote stderr, drops the ssh command line', () => {
+    const e = new Error("Command failed: ssh -o BatchMode=yes -o ControlPath=/tmp/cm/mp mp bash --login -c 'squeue'\nSTDERR: slurm_load_jobs error: Invalid job id specified\nmore");
+    assert.equal(M.briefSshError(e), 'slurm_load_jobs error: Invalid job id specified');
+  });
+  test('no stderr: never echoes the Command failed line', () => {
+    const e = Object.assign(new Error("Command failed: ssh -o ControlPath=/tmp/cm/mp mp x"), { status: 1 });
+    assert.equal(M.briefSshError(e), 'remote command failed (exit 1)');
+    assert.equal(M.briefSshError(new Error('SSH master for mp is dead')), 'SSH master for mp is dead');
+  });
+});
+
+describe('remembered --output patterns (D1)', () => {
+  test('outputPatternFromScript: --output/-o, %x/%u filled, relative + --chdir joined', () => {
+    const f = (t, o = {}) => M.outputPatternFromScript(t, { user: 'u', ...o });
+    assert.equal(f('#!/bin/bash\n#SBATCH --job-name=exp\n#SBATCH --output=/w/logs/%x_%j.out\necho hi'), '/w/logs/exp_%j.out');
+    assert.equal(f('#!/bin/bash\n#SBATCH -J exp\n#SBATCH -o /scratch/%u/%A_%a.log'), '/scratch/u/%A_%a.log');
+    assert.equal(f('#SBATCH --output logs/%j.out\n#SBATCH -D /w/proj'), '/w/proj/logs/%j.out');
+    assert.equal(f('#SBATCH --output="/w/q_%j.out"'), '/w/q_%j.out');
+    assert.equal(f('#SBATCH -o %x.out', { scriptPath: '/w/run.sh' }), 'run.sh.out', 'default job name = script file name');
+    assert.equal(f('#SBATCH --output=/w/%%x_%j.out'), '/w/%%x_%j.out');
+  });
+  test('outputPatternFromScript: stops at the first command; no/unsafe --output → null', () => {
+    const f = (t) => M.outputPatternFromScript(t, { user: 'u' });
+    assert.equal(f('#!/bin/bash\necho hi\n#SBATCH --output=/w/x.out'), null);
+    assert.equal(f('#!/bin/bash\n#SBATCH --time=1'), null);
+    assert.equal(f('#SBATCH --output=/w/$(id).out'), null);
+    assert.equal(f('#SBATCH --output=/w/../x.out'), null);
+    assert.equal(f('#SBATCH --open-mode=append\n#SBATCH --output=/w/a.out'), '/w/a.out');
+  });
+  test('rememberOutputPattern / lookupOutputPattern: per host, array task → base id, capped at OUTPUTS_MAX', () => {
+    assert.equal(M.rememberOutputPattern('541806', '/w/slurm_%j.out', 'fake'), true);
+    assert.equal(M.lookupOutputPattern('541806', 'fake'), '/w/slurm_%j.out');
+    assert.equal(M.lookupOutputPattern('541806', 'other'), null);
+    M.rememberOutputPattern('541822', '/w/slurm_%A_%a.out', 'fake');
+    assert.equal(M.lookupOutputPattern('541822_4', 'fake'), '/w/slurm_%A_%a.out');
+    for (let i = 0; i < M.OUTPUTS_MAX + 5; i++) M.rememberOutputPattern(String(100000 + i), `/w/${i}.out`, 'fake');
+    const map = M.loadOutputPatterns();
+    assert.equal(Object.keys(map).length, M.OUTPUTS_MAX);
+    assert.equal(map['fake|541806'], undefined, 'oldest entries dropped');
+    assert.equal(map[`fake|${100000 + M.OUTPUTS_MAX + 4}`].pattern, `/w/${M.OUTPUTS_MAX + 4}.out`);
+    assert.match(map[`fake|${100000 + M.OUTPUTS_MAX + 4}`].at, /^\d{4}-\d\d-\d\dT/);
+  });
+  test('isValidWatch: outputPattern optional, must be a string when present', () => {
+    assert.equal(M.isValidWatch({ jobId: '1' }), true);
+    assert.equal(M.isValidWatch({ jobId: '1', outputPattern: '/w/%j.out' }), true);
+    assert.equal(M.isValidWatch({ jobId: '1', outputPattern: 5 }), false);
+  });
+});

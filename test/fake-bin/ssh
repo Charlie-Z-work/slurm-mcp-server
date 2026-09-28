@@ -32,6 +32,8 @@
 //   FAKE_SACCT_PAD_MB=<n>       the poll sacct appends ~n MB of step rows
 //                               (huge array jobs)
 //   FAKE_STDOUT=null            sacct StdOut reports "(null)"
+//   FAKE_SCRIPT_HEADER=<text>   `head -n 500 '<script>'` (slurm_submit_file reading
+//                               the #SBATCH header) prints this text
 // Array state machine: sacct reports task 2 RUNNING until either the file named
 // by $FAKE_ARRAY_GATE exists (deterministic mode for tests) or, when no gate is
 // set, until the second sacct poll.
@@ -212,7 +214,7 @@ if (/\|\s*sbatch\b/.test(cmd) || /^sbatch\s/.test(cmd)) {
   // HPC_RESOURCE_LOG lookup: grep exit 2 (missing file) makes the command fail.
   if (/missing/.test(r[2])) out('', 1, `grep: ${r[2]}: No such file or directory`);
   out(`${r[1]}\t2.1G\t00:12:00\tseed=1`);
-} else if (/^ls '/.test(cmd) && /slurm[_-]/.test(cmd)) {
+} else if (/^ls '/.test(cmd) && (/slurm[_-]/.test(cmd) || / 2>\/dev\/null \| head -1$/.test(cmd))) {
   // log-file lookup: `ls '<cand1>' '<cand2>' ... 2>/dev/null | head -1`
   const want = process.env.FAKE_LS_EXISTS;
   const cands = [...cmd.matchAll(/'([^']+)'/g)].map(x => x[1]);
@@ -239,6 +241,8 @@ if (/\|\s*sbatch\b/.test(cmd) || /^sbatch\s/.test(cmd)) {
   out('slogin-01');
 } else if ((r = cmd.match(/^scancel '([^']+)' && echo "(.*)"$/))) {
   out(r[2]);
+} else if (/^head -n 500 '/.test(cmd) && process.env.FAKE_SCRIPT_HEADER != null) {
+  out(process.env.FAKE_SCRIPT_HEADER);
 } else if (/^(tail|head) -n \d+ '/.test(cmd) || /^cat '/.test(cmd)) {
   out('epoch 1 loss 0.9\nepoch 2 loss 0.5');
 } else if (/^ls\b/.test(cmd) || /(&&|;)\s*ls\b/.test(cmd)) {

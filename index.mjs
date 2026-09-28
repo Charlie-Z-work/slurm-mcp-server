@@ -385,7 +385,8 @@ function isValidWatch(w) {
   // tty becomes a file name (heartbeat `<tty>.json`): no "/" or other path
   // syntax. A missing tty is allowed (the watch is simply adopted).
   return idOk && (w.host == null || (typeof w.host === 'string' && RE_HOST.test(w.host))) &&
-    (w.tty == null || (typeof w.tty === 'string' && RE_TTY.test(w.tty)));
+    (w.tty == null || (typeof w.tty === 'string' && RE_TTY.test(w.tty))) &&
+    (w.outputPattern == null || typeof w.outputPattern === 'string');
 }
 const RE_TTY = /^[\w.-]+$/;
 
@@ -498,7 +499,7 @@ function saveWatches(watches) {
   atomicWriteJson(WATCHES_FILE, watches);
 }
 
-function registerWatch(jobId, jobName, estimatedSeconds, partition) {
+function registerWatch(jobId, jobName, estimatedSeconds, partition, outputPattern = null) {
   withFileLock(WATCHES_FILE, () => {
     const watches = loadWatches();
     watches.push({
@@ -510,6 +511,8 @@ function registerWatch(jobId, jobName, estimatedSeconds, partition) {
       estimatedSeconds,
       partition,
       state: 'PENDING',
+      // sbatch --output pattern (slurm_logs fallback, see OUTPUTS_FILE)
+      ...(outputPattern ? { outputPattern } : {}),
     });
     saveWatches(watches);
   });
@@ -520,6 +523,78 @@ function removeWatch(jobId, host = SSH_HOST) {
   withFileLock(WATCHES_FILE, () => {
     saveWatches(loadWatches().filter(w => watchKey(w) !== key));
   });
+}
+
+// --- Remembered --output patterns ---
+// Why: once a job has left slurmctld, sacct is the only source of its log path,
+// and many sites (SMU SuperPOD) do not store StdOut in accounting. slurm_logs
+// then only guessed workdir-relative names and missed every custom absolute
+// output_dir. The pattern is known at submit time, so it is kept here:
+// { "<host>|<jobId>": { pattern, at } }, newest last, capped at OUTPUTS_MAX.
+const OUTPUTS_FILE = join(homedir(), '.claude', 'slurm-outputs.json');
+const OUTPUTS_MAX = 500;
+const isPlainObject = (d) => !!d && typeof d === 'object' && !Array.isArray(d);
+function loadOutputPatterns() {
+  return readJsonOrQuarantine(OUTPUTS_FILE, {}, isPlainObject);
+}
+// Best effort: runs after sbatch succeeded, so it must never throw.
+function rememberOutputPattern(jobId, pattern, host = SSH_HOST) {
+  if (!pattern || typeof pattern !== 'string') return false;
+  try {
+    withFileLock(OUTPUTS_FILE, () => {
+      const map = loadOutputPatterns();
+      const key = `${host}|${jobId}`;
+      delete map[key]; // re-insert → newest last (keys are non-numeric strings: insertion order)
+      map[key] = { pattern, at: new Date().toISOString() };
+      const keys = Object.keys(map);
+      for (const k of keys.slice(0, Math.max(0, keys.length - OUTPUTS_MAX))) delete map[k];
+      atomicWriteJson(OUTPUTS_FILE, map);
+    });
+    return true;
+  } catch (err) {
+    logDebug(`rememberOutputPattern(${jobId}) failed: ${err.message}`);
+    return false;
+  }
+}
+// Pattern for a job id as passed to slurm_logs ("123", "123_4", "123+1"):
+// looked up by base id in OUTPUTS_FILE, then in the watch list.
+function lookupOutputPattern(jid, host = SSH_HOST) {
+  const base = String(jid).match(/^\d+/)?.[0];
+  if (!base) return null;
+  const e = loadOutputPatterns()[`${host}|${base}`];
+  if (isPlainObject(e) && typeof e.pattern === 'string' && e.pattern) return e.pattern;
+  const w = loadWatches().find(x => watchKey(x) === `${host}|${base}` && typeof x.outputPattern === 'string');
+  return w?.outputPattern || null;
+}
+
+// --output / --job-name / --chdir from a batch script's #SBATCH header.
+// sbatch stops reading #SBATCH lines at the first command line, so parsing
+// stops there too. Returns the pattern with %x (job name) and %u (user)
+// already filled in — they are fixed at submit time, unlike %j/%A/%a — or
+// null when the script has no --output (or an unusable one).
+function outputPatternFromScript(text, { scriptPath = '', user = SSH_USER } = {}) {
+  const opts = {};
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    if (!line || (line.startsWith('#') && !line.startsWith('#SBATCH'))) continue;
+    if (!line.startsWith('#SBATCH')) break;
+    const m = line.match(/^#SBATCH\s+(?:(--output|--job-name|--chdir)(?:=|\s+)|(-[oJD])\s*)(\S+)/);
+    if (!m) continue;
+    const key = m[1] || { '-o': '--output', '-J': '--job-name', '-D': '--chdir' }[m[2]];
+    let v = m[3];
+    if (/^(["']).*\1$/.test(v)) v = v.slice(1, -1);
+    opts[key] = v; // a repeated option: the last one wins
+  }
+  let pattern = opts['--output'];
+  if (!pattern || /\s|['"]/.test(pattern) || validatePath(pattern, 'output')) return null;
+  const jobName = opts['--job-name'] || String(scriptPath).split('/').pop() || '';
+  pattern = pattern.replace(/%%|%x|%u/g, t => (t === '%%' ? '%%' : t === '%x' ? jobName : user));
+  const chdir = opts['--chdir'];
+  if (!pattern.startsWith('/') && chdir && chdir.startsWith('/') && !/\s|['"]/.test(chdir)) {
+    pattern = `${chdir.replace(/\/+$/, '')}/${pattern}`;
+  }
+  if (validatePath(pattern, 'output') || /['"\s]/.test(pattern)) return null;
+  return pattern;
 }
 
 // registerWatch runs AFTER sbatch succeeded: it must never turn a queued job
@@ -621,20 +696,61 @@ function countTasksInKey(taskKey) {
   return n || 1;
 }
 
+// Array task ids a range key like "[5-9]", "[1,3,5-7]" or "[1-9:2%2]" stands
+// for, as a list of [start, end, step] parts; null for unknown shapes.
+function taskKeyRanges(taskKey) {
+  if (!taskKey || !String(taskKey).startsWith('[')) return null;
+  const body = String(taskKey).slice(1, -1).split('%')[0];
+  const parts = [];
+  for (const part of body.split(',')) {
+    const r = part.match(/^(\d+)(?:-(\d+))?(?::(\d+))?$/);
+    if (!r) return null;
+    const step = r[3] ? +r[3] : 1;
+    if (step < 1) return null;
+    parts.push([+r[1], r[2] ? +r[2] : +r[1], step]);
+  }
+  return parts;
+}
+
+// How many tasks each unit key stands for. Why: while tasks are split out of
+// the pending meta record, one sacct snapshot holds BOTH the range row
+// "123_[5-9]|PENDING" and the already split-out "123_5|RUNNING"; counting both
+// inflated the total (a 9-task array showed "0/14"). A range key only counts
+// its task ids that have no explicit row; a range fully covered by explicit
+// rows counts 0 (and is ignored for the verdict).
+function unitWeights(taskStates) {
+  const explicit = new Set();
+  for (const k of taskStates.keys()) if (k != null && /^\d+$/.test(String(k))) explicit.add(+k);
+  const weights = new Map();
+  for (const k of taskStates.keys()) {
+    const ranges = taskKeyRanges(k);
+    if (!ranges) { weights.set(k, countTasksInKey(k)); continue; }
+    let n = 0;
+    for (const [a, b, step] of ranges) for (let i = a; i <= b; i += step) if (!explicit.has(i)) n++;
+    weights.set(k, n);
+  }
+  return weights;
+}
+
 // Collapse all sacct rows of one job (plain or array) into a single verdict.
 // Why: an array job may only be reported done once EVERY task is terminal;
 // partial completion must keep the watch alive.
 function summarizeJobRows(taskStates) {
-  const states = [...taskStates.values()];
+  const weights = unitWeights(taskStates);
+  // Range rows whose tasks all have their own row add nothing (see unitWeights).
+  const units = [...taskStates].filter(([k]) => weights.get(k) > 0);
+  const effective = units.length ? units : [...taskStates];
+  const states = effective.map(([, st]) => st);
   const keys = [...taskStates.keys()];
   const isArray = keys.some(k => k !== null && !String(k).startsWith('+'));
   const isHet = keys.some(k => k !== null && String(k).startsWith('+'));
   const allDone = states.length > 0 && states.every(isTerminalState);
-  let ok = 0, failed = 0;
+  let ok = 0, failed = 0, total = 0;
   const failedKinds = new Map();
-  for (const [key, st] of taskStates) {
+  for (const [key, st] of effective) {
+    const n = weights.get(key);
+    total += n;
     if (!isTerminalState(st)) continue;
-    const n = countTasksInKey(key);
     if (baseState(st) === 'COMPLETED') ok += n;
     else { failed += n; failedKinds.set(baseState(st), (failedKinds.get(baseState(st)) || 0) + n); }
   }
@@ -642,7 +758,7 @@ function summarizeJobRows(taskStates) {
   // Single verdict for non-array jobs: for a hetjob the first non-COMPLETED
   // component decides (a plain job has exactly one state).
   const verdict = states.find(st => baseState(st) !== 'COMPLETED') ?? states[0];
-  return { isArray, isHet, allDone, ok, failed, failedKinds, running, states, verdict };
+  return { isArray, isHet, allDone, ok, failed, total, failedKinds, running, states, verdict };
 }
 
 const MAX_PENDING = 50;
@@ -1043,8 +1159,7 @@ async function pollOnce() {
     const newState = (sum.isArray || sum.isHet)
       ? (sum.running ? 'RUNNING' : baseState(sum.states.find(st => !isTerminalState(st))))
       : sum.states[0];
-    const total = [...tasks.keys()].reduce((n, k) => n + countTasksInKey(k), 0);
-    const progress = sum.isArray ? `${sum.ok + sum.failed}/${total}` : undefined;
+    const progress = sum.isArray ? `${sum.ok + sum.failed}/${sum.total}` : undefined;
     if (w.state !== newState || w.progress !== progress) {
       w.state = newState;
       w.progress = progress;
@@ -1587,14 +1702,20 @@ server.tool('slurm_status', 'Check SLURM job status (squeue + sacct). For array 
       // queue ("Invalid job id specified"), which used to hide the sacct
       // history — exactly the case where it matters. Error only if both fail.
       // Quoted: "12345_[1-5]" would otherwise be a bash glob.
+      // A failure shows the remote stderr only: the raw exec error starts
+      // with the whole ssh command line (ControlPath and all), which buried
+      // the one useful line ("slurm_load_jobs error: Invalid job id specified").
       const run = (cmd) => {
-        try { return { ok: true, text: sshExec(cmd, 15000) }; } catch (e) { return { ok: false, text: String(e?.message ?? e) }; }
+        try { return { ok: true, text: sshExec(cmd, 15000) }; } catch (e) { return { ok: false, text: briefSshError(e) }; }
       };
       const squeue = run(`squeue -j '${jid}'`);
       const sacct = run(`sacct -j '${jid}'`);
+      const squeueFailure = /invalid job id/i.test(squeue.text)
+        ? `(squeue: ${squeue.text} — job left the queue; sacct below)`
+        : `(squeue failed: ${squeue.text})`;
       const text = [
         '=== squeue ===',
-        squeue.ok ? (squeue.text || '(no output)') : `(squeue failed: ${squeue.text})`,
+        squeue.ok ? (squeue.text || '(no output)') : squeueFailure,
         '',
         '=== sacct ===',
         sacct.ok ? (sacct.text || '(no output)') : `(sacct failed: ${sacct.text})`,
@@ -1618,6 +1739,16 @@ function firstLine(err) {
   const stderr = msg.match(/STDERR: (.*)/)?.[1]?.trim();
   if (stderr) return stderr;
   return msg.split('\n').find(l => l.trim())?.trim() || 'unknown error';
+}
+
+// Like firstLine, but never echoes the "Command failed: ssh <options> ..."
+// line (it carries the local ControlPath and the whole remote command).
+function briefSshError(err) {
+  const line = firstLine(err);
+  if (!/^Command failed: /.test(line)) return line;
+  const rest = String(err?.message ?? err).split('\n').slice(1).map(l => l.trim())
+    .find(l => l && !/^Command failed: /.test(l));
+  return rest || `remote command failed${err?.status != null ? ` (exit ${err.status})` : ''}`;
 }
 
 // Returns { status: 'ok' | 'empty' | 'error', text, reason }.
@@ -2083,6 +2214,7 @@ server.tool('slurm_submit',
     return { content: [{ type: 'text', text: `Submit rejected: log directory "${outputDir}" contains "%" (sbatch would expand it in --output, but mkdir creates the literal directory) — fix output_dir or reset the workdir with workdir_set` }], isError: true };
   }
 
+  const outputPattern = `${outputDir}/${args.array ? 'slurm_%A_%a.out' : 'slurm_%j.out'}`;
   const lines = [
     '#!/bin/bash',
     ...(SLURM_ACCOUNT ? [`#SBATCH --account=${SLURM_ACCOUNT}`] : []),
@@ -2091,7 +2223,7 @@ server.tool('slurm_submit',
     `#SBATCH --time=${args.time}`,
     `#SBATCH --mem=${args.mem}`,
     // Array tasks share %j-less names otherwise and overwrite each other's log.
-    `#SBATCH --output=${outputDir}/${args.array ? 'slurm_%A_%a.out' : 'slurm_%j.out'}`,
+    `#SBATCH --output=${outputPattern}`,
   ];
   if (args.gpus != null && args.gpus > 0) lines.push(`#SBATCH --gres=gpu:${args.gpus}`);
   if (args.cpus_per_task) lines.push(`#SBATCH --cpus-per-task=${args.cpus_per_task}`);
@@ -2128,11 +2260,12 @@ server.tool('slurm_submit',
     if (jobMatch) {
       const jobId = jobMatch[1];
       const estSeconds = timeSec;
+      rememberOutputPattern(jobId, outputPattern); // slurm_logs after sacct/scontrol forget it
       // No accounting on this cluster: a watch could never complete.
       if (sacctUnavailableFor(SSH_HOST)) {
         return { content: [{ type: 'text', text: `${out}\n${SACCT_UNAVAILABLE_NOTE} ${jobId}.${limitHints}${resourceInfo}${workdirHint}` }] };
       }
-      const watchErr = tryRegisterWatch(jobId, args.job_name, estSeconds, args.partition);
+      const watchErr = tryRegisterWatch(jobId, args.job_name, estSeconds, args.partition, outputPattern);
       const estMin = Math.round(estSeconds / 60);
       // No POLL_CMD suggestion: the built-in 30s batched watcher already
       // monitors this job and piggybacks a notification onto the next tool
@@ -2176,20 +2309,46 @@ function isUsableLogPath(p) {
   return !!s && !NO_LOG_PATHS.has(s.toLowerCase()) && !s.includes('%');
 }
 
-server.tool('slurm_logs', 'Read SLURM job output log. For array jobs pass one task, e.g. "12345_3" (logs are slurm_<jobid>_<task>.out).', {
+server.tool('slurm_logs', 'Read SLURM job output log. For array jobs pass one task, e.g. "12345_3" (logs are slurm_<jobid>_<task>.out). Remembers the --output pattern of jobs submitted through slurm_submit/slurm_submit_file, so logs of finished jobs are found even where sacct stores no StdOut; pass `path` to read a known log file directly.', {
   job_id: z.string().describe('Job ID "12345", or for an array job one task "12345_3"'),
   lines: z.number().optional().default(50).describe('Number of lines to read (default 50, use 0 for all)'),
+  path: z.string().optional().describe('Log file path on the cluster (skips the lookup), e.g. the --output file of a job submitted outside this server'),
 }, async (args) => {
   try {
     const jid = validateJobId(args.job_id);
-    // Find the log file. sacct StdOut is empty on clusters whose accounting
-    // doesn't store it (e.g. SMU SuperPOD, verified 2026-07-02) — fall back
-    // to scontrol (recent/running jobs), then to the stored workdir's log dirs.
+    // Lookup order: explicit path → the --output pattern remembered at submit
+    // (OUTPUTS_FILE / watch) → sacct StdOut → scontrol → the stored workdir's
+    // log dirs. Why the remembered pattern comes before sacct: sacct StdOut is
+    // empty on clusters whose accounting doesn't store it (e.g. SMU SuperPOD,
+    // verified 2026-07-02) and scontrol forgets a job minutes after it ends,
+    // so a custom output_dir was unfindable once the job had finished.
     // A path is usable only if it is concrete: sacct may return the raw
     // --output pattern with %j/%A/%a placeholders unexpanded.
     const usable = isUsableLogPath;
-    const sacctPath = sshExec(`sacct -j '${jid}' --format=StdOut%-200 -P -n | head -1`, 10000).trim();
-    let stdoutPath = usable(sacctPath) ? sacctPath : '';
+    const exists = (p) => {
+      try { return sshExec(`ls '${p}' 2>/dev/null | head -1`, 10000).trim() || ''; } catch { return ''; }
+    };
+    let stdoutPath = '';
+    let expected = '';
+    if (args.path != null) {
+      const p = String(args.path).trim();
+      const err = !p ? 'path is empty' : validatePath(p, 'path');
+      if (err) return { content: [{ type: 'text', text: `Log read rejected: ${err}` }], isError: true };
+      stdoutPath = p;
+    }
+    if (!stdoutPath) {
+      const remembered = lookupOutputPattern(jid);
+      const p = remembered ? expandLogPattern(remembered, jid) : null;
+      if (p) {
+        stdoutPath = exists(p);
+        if (!stdoutPath) expected = p;
+      }
+    }
+    let sacctPath = '';
+    if (!stdoutPath) {
+      sacctPath = sshExec(`sacct -j '${jid}' --format=StdOut%-200 -P -n | head -1`, 10000).trim();
+      if (usable(sacctPath)) stdoutPath = sacctPath;
+    }
     if (!stdoutPath) {
       try {
         // An array base id prints one record (one StdOut=) per task: use the
@@ -2199,12 +2358,8 @@ server.tool('slurm_logs', 'Read SLURM job output log. For array jobs pass one ta
       } catch { /* job no longer known to slurmctld */ }
     }
     if (!stdoutPath && sacctPath.includes('%')) {
-      stdoutPath = expandLogPattern(sacctPath, jid) || '';
-      if (stdoutPath) {
-        try {
-          stdoutPath = sshExec(`ls '${stdoutPath}' 2>/dev/null | head -1`, 10000).trim();
-        } catch { stdoutPath = ''; }
-      }
+      const p = expandLogPattern(sacctPath, jid);
+      if (p) stdoutPath = exists(p);
     }
     if (!stdoutPath) {
       const wd = loadWorkdir();
@@ -2219,7 +2374,8 @@ server.tool('slurm_logs', 'Read SLURM job output log. For array jobs pass one ta
       }
     }
     if (!stdoutPath || stdoutPath === '|') {
-      return { content: [{ type: 'text', text: `No log file found for job ${jid}. Notes: this cluster's sacct does not store StdOut and scontrol only knows recent jobs — pass the --output path you used, and avoid /tmp for --output (it is node-local on compute nodes, the file never reaches the login node).` }] };
+      const exp = expected ? ` Expected ${expected} (from the --output pattern used at submit) — it does not exist (yet): the job may not have started, or wrote elsewhere.` : '';
+      return { content: [{ type: 'text', text: `No log file found for job ${jid}.${exp} Notes: this cluster's sacct does not store StdOut and scontrol only knows recent jobs — pass \`path\` (the log file, i.e. the --output you used) to read it directly, and avoid /tmp for --output (it is node-local on compute nodes, the file never reaches the login node).` }] };
     }
     if (UNSAFE_PATH.test(stdoutPath)) {
       return { content: [{ type: 'text', text: `Suspicious log path from sacct: ${stdoutPath}` }], isError: true };
@@ -2272,6 +2428,7 @@ function expandLogPattern(pattern, jid) {
   return out;
 }
 
+const SCRIPT_HEADER_LINES = 500;
 server.tool('slurm_submit_file', 'Submit an existing .slurm/.sh script file on HPC', {
   path: z.string().describe('Absolute path to the .slurm/.sh file on HPC'),
 }, async (args) => {
@@ -2293,10 +2450,18 @@ server.tool('slurm_submit_file', 'Submit an existing .slurm/.sh script file on H
       // [\w.-]{1,64} shape slurm_submit enforces for job_name.
       const baseName = args.path.split('/').pop() || '';
       const jobName = RE_JOB_NAME.test(baseName) ? baseName : (baseName.replace(/[^\w.-]/g, '_').slice(0, 64) || 'script-job');
+      // The script's #SBATCH --output (if any), for slurm_logs. Best effort:
+      // the job is queued already, a failed read only loses the log hint.
+      let outputPattern = null;
+      try {
+        const header = sshExec(`head -n ${SCRIPT_HEADER_LINES} '${args.path.replace(/'/g, "'\\''")}'`, 10000);
+        outputPattern = outputPatternFromScript(header, { scriptPath: args.path });
+      } catch (err) { logDebug(`submit_file: reading #SBATCH header of ${args.path} failed: ${err.message}`); }
+      if (outputPattern) rememberOutputPattern(jobId, outputPattern);
       if (sacctUnavailableFor(SSH_HOST)) {
         return { content: [{ type: 'text', text: `${out}\n${SACCT_UNAVAILABLE_NOTE} ${jobId}.` }] };
       }
-      const watchErr = tryRegisterWatch(jobId, jobName, 3600, defaultPartition());
+      const watchErr = tryRegisterWatch(jobId, jobName, 3600, defaultPartition(), outputPattern);
       const watchNote = watchErr
         ? `\n⚠️ The job IS queued (do not resubmit), but watch registration failed: ${watchErr} — check it with slurm_status ${jobId}.`
         : `\n👁️ Watch registered: job ${jobId}`;
@@ -2798,7 +2963,8 @@ export {
   guardCommand, BLOCKED_PATTERNS, MAX_CMD_LENGTH, compressOutput,
   atomicWriteJson, readJsonOrQuarantine, withFileLock, reclaimStaleLock,
   aggregateSacctRows, isWatchExpired, isValidWatch, parseMemToMB, summarizeResourceReport,
-  expandLogPattern, safePoll, pollState,
+  expandLogPattern, safePoll, pollState, taskKeyRanges, unitWeights, briefSshError,
+  rememberOutputPattern, lookupOutputPattern, loadOutputPatterns, outputPatternFromScript, OUTPUTS_FILE, OUTPUTS_MAX,
   sshBaseArgs, sshOptsFor, parseControlPath, pollerAlive, withBusyHeartbeat, loadNotifications, NOTIF_FILE, partitionNotifications,
   mergePolledWatch, formatWatchLine, parseScontrolStdOut, expandLocalHome,
   RE_HOST, RE_USER, RE_ENV_TOKEN, shq, sacctSinceDate, isLockStale, readLockOwner,

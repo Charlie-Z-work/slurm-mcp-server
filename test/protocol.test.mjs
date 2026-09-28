@@ -587,7 +587,9 @@ describe('partial failures (B11, B12)', () => {
     try {
       const r = await s.call('slurm_status', { job_id: '541806' });
       assert.equal(r.isError, false, r.text);
-      assert.match(r.text, /=== squeue ===\n\(squeue failed: [\s\S]*Invalid job id specified/);
+      assert.match(r.text, /=== squeue ===\n\(squeue: slurm_load_jobs error: Invalid job id specified — job left the queue; sacct below\)\n/);
+      // D3: only the remote stderr line, never the local ssh command line.
+      assert.doesNotMatch(r.text, /ControlPath=|Command failed|bash --login/);
       assert.match(r.text, /=== sacct ===\n[\s\S]*541806\s+train\s+batch/);
     } finally { await s.stop(); }
   });
@@ -1524,5 +1526,69 @@ describe('manual ssh success ends the poller backoff (G7)', () => {
         assert.ok(Date.now() - t0 < 3000, `${tool}: watch resumed after ${Date.now() - t0}ms`);
       }
     } finally { await s.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+// ---- Live experiment fixes (D1, D3) ----
+
+describe('slurm_logs remembers --output patterns (D1)', () => {
+  const LOGDIR = '/users/u/finding/results/config_compare/logs';
+  test('custom absolute output_dir: found after sacct/scontrol forgot the job', async () => {
+    const s = await startServer({ env: { FAKE_STDOUT: 'empty', FAKE_LS_EXISTS: `${LOGDIR}/slurm_541806.out`, SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const sub = await s.call('slurm_submit', { script: 'echo hi', output_dir: LOGDIR });
+      assert.equal(sub.isError, false, sub.text);
+      const map = JSON.parse(readFileSync(join(s.home, '.claude', 'slurm-outputs.json'), 'utf8'));
+      assert.equal(map['fake|541806'].pattern, `${LOGDIR}/slurm_%j.out`);
+      assert.equal(s.readWatches().find(w => w.jobId === '541806').outputPattern, `${LOGDIR}/slurm_%j.out`);
+      const r = await s.call('slurm_logs', { job_id: '541806', lines: 0 });
+      assert.equal(r.isError, false, r.text);
+      assert.match(r.text, /epoch 2 loss 0\.5/);
+      assert.ok(execs(s).some(e => e.cmd === `cat '${LOGDIR}/slurm_541806.out'`), JSON.stringify(execs(s).map(e => e.cmd)));
+    } finally { await s.stop(); }
+  });
+  test('array task "541822_5": %A_%a expanded from the remembered pattern', async () => {
+    const s = await startServer({ scenario: 'array', env: { FAKE_STDOUT: 'empty', FAKE_LS_EXISTS: `${LOGDIR}/slurm_541822_5.out`, SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const sub = await s.call('slurm_submit', { script: 'echo $SLURM_ARRAY_TASK_ID', output_dir: LOGDIR, array: '1-9' });
+      assert.equal(sub.isError, false, sub.text);
+      const r = await s.call('slurm_logs', { job_id: '541822_5', lines: 5 });
+      assert.equal(r.isError, false, r.text);
+      assert.ok(execs(s).some(e => e.cmd === `tail -n 5 '${LOGDIR}/slurm_541822_5.out'`), JSON.stringify(execs(s).map(e => e.cmd)));
+    } finally { await s.stop(); }
+  });
+  test('log not there yet: the message names the expected file and the `path` parameter', async () => {
+    const s = await startServer({ env: { FAKE_STDOUT: 'empty', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      await s.call('slurm_submit', { script: 'echo hi', output_dir: LOGDIR });
+      const r = await s.call('slurm_logs', { job_id: '541806' });
+      assert.match(r.text, new RegExp(`Expected ${LOGDIR}/slurm_541806\\.out`));
+      assert.match(r.text, /pass `path`/);
+    } finally { await s.stop(); }
+  });
+  test('slurm_submit_file: #SBATCH --output of the script is remembered (%x filled in)', async () => {
+    const header = '#!/bin/bash\n#SBATCH --job-name=cmp\n#SBATCH --output=/scratch/u/%x_%j.log\nsrun python x.py';
+    const s = await startServer({ env: { FAKE_STDOUT: 'empty', FAKE_SCRIPT_HEADER: header, FAKE_LS_EXISTS: '/scratch/u/cmp_541806.log', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const sub = await s.call('slurm_submit_file', { path: '/home/u/job.slurm' });
+      assert.equal(sub.isError, false, sub.text);
+      assert.ok(execs(s).some(e => e.cmd === "head -n 500 '/home/u/job.slurm'"));
+      const r = await s.call('slurm_logs', { job_id: '541806', lines: 5 });
+      assert.ok(execs(s).some(e => e.cmd === "tail -n 5 '/scratch/u/cmp_541806.log'"), r.text);
+    } finally { await s.stop(); }
+  });
+  test('explicit `path` is read directly; unsafe paths are rejected', async () => {
+    const s = await startServer({ env: { SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const r = await s.call('slurm_logs', { job_id: '541806', path: '/users/u/other/run.log', lines: 0 });
+      assert.equal(r.isError, false, r.text);
+      assert.match(r.text, /epoch 2 loss 0\.5/);
+      assert.ok(execs(s).some(e => e.cmd === "cat '/users/u/other/run.log'"));
+      assert.ok(!execs(s).some(e => /^sacct -j '541806' --format=StdOut/.test(e.cmd)), 'no lookup when path is given');
+      for (const bad of ['/w/../etc/passwd', '/w/$(id).log', '']) {
+        const b = await s.call('slurm_logs', { job_id: '541806', path: bad });
+        assert.equal(b.isError, true, bad);
+      }
+    } finally { await s.stop(); }
   });
 });

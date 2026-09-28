@@ -9,6 +9,11 @@ All notable changes to this project are documented here. The format follows
 ### Removed
 - Dead code with no callers since the batched poller / ControlMaster probe: `parseTimeToSeconds`, `checkJobState`, `checkJobStateAsync`, `masterAlive`, `exec` (46 lines; every reviewer flagged them, owner approved).
 
+### Fixed (live experiment)
+- `slurm_logs` finds the logs of finished jobs submitted with a custom `output_dir`. `slurm_submit` and `slurm_submit_file` (when the script has `#SBATCH --output`/`-o`) remember the `--output` pattern in `~/.claude/slurm-outputs.json` (atomic write + lock, last 500 jobs; also stored on the watch as `outputPattern`). Lookup order is now: explicit `path` → remembered pattern (`%j`, `%A`/`%a` for array tasks) → sacct `StdOut` → `scontrol` → workdir log dirs. Before, a completed job on a site whose sacct stores no `StdOut` returned "No log file found". New `path` parameter reads a known log file directly.
+- Array progress in `slurm_watches` no longer over-counts while tasks are being split out of the pending record: a snapshot with both `123_[5-9]|PENDING` and `123_5|RUNNING` counted task 5 twice (a 9-task array showed "0/14"). Range rows now only count task ids without their own row; the completion tally uses the same count.
+- `slurm_status` on a job that left the queue shows only the squeue stderr line ("slurm_load_jobs error: Invalid job id specified — job left the queue; sacct below") instead of the whole ssh command line with its ControlPath.
+
 ### Fixed (convergence check)
 - `sync_files`: `remote_path` now uses a strict allowlist (letters and digits of any script incl. combining marks, `. / _ - + @ : , =` and a leading `~`). Without protect-args (openrsync has no `-s`) the remote shell expands quotes and globs, so `/data/""` became `/data/` and `--delete` could prune the wrong directory.
 - Accounting-less detection only triggers on "accounting storage is disabled" / `accounting_storage/none`; transient slurmdbd connection errors no longer suppress watch registration for an hour, and a successful resource-history query clears the mark.

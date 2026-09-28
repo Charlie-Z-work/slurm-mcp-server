@@ -187,7 +187,7 @@ Start a tmux-based interactive SSH session for commands needing 2FA, confirmatio
 | | `slurm_submit` | Submit batch job (supports arrays + templates) |
 | | `slurm_submit_file` | Submit existing .slurm/.sh script |
 | | `slurm_cancel` | Cancel job |
-| | `slurm_logs` | Read job output log (sacct → scontrol → workdir fallback) |
+| | `slurm_logs` | Read job output log (remembers --output patterns of jobs it submitted → sacct → scontrol → workdir fallback; `path` reads a file directly) |
 | | `slurm_watches` | List active job watches |
 | | `resource_check` | Check historical resource usage |
 | | `resource_report` | Summarize usage over time period |

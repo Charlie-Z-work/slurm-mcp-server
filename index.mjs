@@ -535,18 +535,6 @@ function tryRegisterWatch(...args) {
   }
 }
 
-function parseTimeToSeconds(timeStr) {
-  const dayMatch = timeStr.match(/^(\d+)-(\d+):(\d+):(\d+)$/);
-  if (dayMatch) {
-    return parseInt(dayMatch[1]) * 86400 + parseInt(dayMatch[2]) * 3600 +
-           parseInt(dayMatch[3]) * 60 + parseInt(dayMatch[4]);
-  }
-  const parts = timeStr.split(':').map(Number);
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return 900;
-}
-
 // Strict parser for every --time format sbatch accepts. Returns seconds, or
 // null when the string is not a valid SLURM time (used as an input whitelist,
 // so anything unparsable is rejected before it reaches the #SBATCH header).
@@ -561,32 +549,6 @@ function parseSlurmTime(str) {
   if ((m = t.match(/^(\d+)-(\d+):(\d+)$/))) return +m[1] * 86400 + +m[2] * 3600 + +m[3] * 60; // D-H:M
   if ((m = t.match(/^(\d+)-(\d+):(\d+):(\d+)$/))) return +m[1] * 86400 + +m[2] * 3600 + +m[3] * 60 + +m[4]; // D-H:M:S
   return null;
-}
-
-function checkJobState(jobId) {
-  try {
-    const out = sshExec(`sacct -j ${jobId} --format=State -P -n | head -1`, 15000);
-    return out.split('\n')[0]?.trim() || 'UNKNOWN';
-  } catch (err) {
-    logDebug(`checkJobState(${jobId}) sync failed: ${err.message}`);
-    return 'UNKNOWN';
-  }
-}
-
-// Async version for polling (non-blocking)
-async function checkJobStateAsync(jobId) {
-  try {
-    const escaped = `sacct -j ${jobId} --format=State -P -n | head -1`.replace(/'/g, "'\"'\"'");
-    const mode = probeMaster(SSH_HOST).state;
-    if (mode === 'dead') return 'UNKNOWN'; // never a doomed reconnect (see sshExec)
-    const { stdout } = await execFileAsync('ssh', [...sshBaseArgs(mode, SSH_HOST), SSH_HOST, `bash --login -c '${escaped}'`], {
-      timeout: 15000, encoding: 'utf8',
-    });
-    return stdout.split('\n')[0]?.trim() || 'UNKNOWN';
-  } catch (err) {
-    logDebug(`checkJobStateAsync(${jobId}) failed: ${err.message}`);
-    return 'UNKNOWN';
-  }
 }
 
 const TERMINAL_STATES = new Set([
@@ -927,10 +889,6 @@ function probeMaster(host) {
   if (/No ControlPath specified/i.test(output)) return { state: REQUIRE_MASTER ? 'dead' : 'unconfigured', output };
   return { state: 'dead', output };
 }
-function masterAlive(host) {
-  return probeMaster(host).state !== 'dead';
-}
-
 async function pollOnce() {
   // Orphan guard: if the parent Claude session died we get re-parented to
   // PID 1 — exit instead of polling forever (2026-07-02: 28 zombies found).
@@ -1201,10 +1159,6 @@ function describeExecError(err, maxBuffer, what = '') {
     return `output exceeded ${Math.round(maxBuffer / 1048576)} MB${what ? ` (${what})` : ''} — too many array tasks/steps for one query`;
   }
   return String(err?.message ?? err);
-}
-
-function exec(cmd, timeout = TIMEOUT) {
-  return execSync(cmd, { timeout, stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 5 * 1024 * 1024 }).toString().trim();
 }
 
 // Why: the cluster uses chained publickey+Duo MFA. Without BatchMode, an ssh

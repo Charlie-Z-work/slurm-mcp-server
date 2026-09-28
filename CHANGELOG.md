@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## Unreleased
 
+### Removed
+- Dead code with no callers since the batched poller / ControlMaster probe: `parseTimeToSeconds`, `checkJobState`, `checkJobStateAsync`, `masterAlive`, `exec` (46 lines; every reviewer flagged them, owner approved).
+
 ### Fixed (convergence check)
 - `sync_files`: `remote_path` now uses a strict allowlist (letters and digits of any script, `. / _ - + @ :` and a leading `~`). Without protect-args (openrsync has no `-s`) the remote shell expands quotes and globs, so `/data/""` became `/data/` and `--delete` could prune the wrong directory.
 - Accounting-less detection only triggers on "accounting storage is disabled" / `accounting_storage/none`; transient slurmdbd connection errors no longer suppress watch registration for an hour, and a successful resource-history query clears the mark.

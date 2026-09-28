@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: npm test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      # The fake ssh/rsync are committed with mode 100755; this guards against
+      # a checkout that dropped the executable bit.
+      - run: chmod +x test/fake-bin/ssh test/fake-bin/rsync test/fake-bin/osascript test/fake-bin/notify-send
+      - run: npm ci
+      - run: npm test

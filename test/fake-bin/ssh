@@ -1,0 +1,127 @@
+#!/usr/bin/env node
+// Fake `ssh` for the offline test suite. It never touches the network: it
+// logs the call to $FAKE_LOG (one JSON object per line) and answers the remote
+// command with output copied from a real SLURM cluster.
+//
+// Scenarios ($FAKE_SCENARIO): normal (default) | array | cancelled_by |
+// master_dead | sbatch_fail.
+// Array state machine: sacct reports task 2 RUNNING until either the file named
+// by $FAKE_ARRAY_GATE exists (deterministic mode for tests) or, when no gate is
+// set, until the second sacct poll.
+const { appendFileSync, existsSync, readFileSync, writeFileSync } = require('node:fs');
+
+const argv = process.argv.slice(2);
+const scenario = process.env.FAKE_SCENARIO || 'normal';
+const LOG = process.env.FAKE_LOG;
+
+function readStdin() {
+  try { return readFileSync(0, 'utf8'); } catch { return ''; }
+}
+function log(entry) {
+  if (LOG) appendFileSync(LOG, JSON.stringify({ scenario, argv, ...entry }) + '\n');
+}
+function out(text, code = 0, err = '') {
+  if (text) process.stdout.write(text.endsWith('\n') ? text : text + '\n');
+  if (err) process.stderr.write(err.endsWith('\n') ? err : err + '\n');
+  process.exit(code);
+}
+
+// --- Control-master probe: ssh -O check <host> ---
+const oi = argv.indexOf('-O');
+if (oi >= 0) {
+  const op = argv[oi + 1];
+  log({ kind: 'control', op });
+  if (scenario === 'master_dead') {
+    out('', 255, 'Control socket connect(/tmp/cm-fake): No such file or directory');
+  }
+  out('', 0, 'Master running (pid=1)');
+}
+
+// --- Remote command: last argument ---
+const last = argv[argv.length - 1] || '';
+let cmd = last;
+let wrapped = false;
+const m = last.match(/^bash --login -c '([\s\S]*)'$/);
+if (m) { cmd = m[1].replace(/'"'"'/g, "'"); wrapped = true; }
+
+// ssh_write_file pipes the content on stdin: `cat > '/path'` / `cat >> '/path'`.
+const w = !wrapped && cmd.match(/^cat (>>?) '([\s\S]*)'$/);
+if (w) {
+  const data = readStdin();
+  log({ kind: 'write', cmd, op: w[1], path: w[2].replace(/'"'"'/g, "'"), bytes: Buffer.byteLength(data) });
+  out('');
+}
+log({ kind: 'exec', cmd, wrapped });
+
+const stateFile = LOG ? `${LOG}.array-calls` : null;
+const JOB_IDS = { normal: '541806', array: '541822', cancelled_by: '541900' };
+
+function sacctPollRows(ids) {
+  const rows = [];
+  for (const id of ids) {
+    if (scenario === 'array' && id === '541822') {
+      let calls = 0;
+      if (stateFile && existsSync(stateFile)) calls = +readFileSync(stateFile, 'utf8') || 0;
+      calls++;
+      if (stateFile) writeFileSync(stateFile, String(calls));
+      const gate = process.env.FAKE_ARRAY_GATE;
+      const done = gate ? existsSync(gate) : calls >= 2;
+      rows.push('541822_1|COMPLETED', '541822_1.batch|COMPLETED', '541822_1.extern|COMPLETED');
+      if (done) rows.push('541822_2|COMPLETED', '541822_2.batch|COMPLETED', '541822_2.extern|COMPLETED');
+      else rows.push('541822_2|RUNNING', '541822_2.batch|RUNNING', '541822_2.extern|RUNNING');
+    } else if (scenario === 'cancelled_by' && id === '541900') {
+      rows.push('541900|CANCELLED by 12345', '541900.batch|CANCELLED', '541900.extern|COMPLETED');
+    } else {
+      rows.push(`${id}|COMPLETED`, `${id}.batch|COMPLETED`, `${id}.extern|COMPLETED`);
+    }
+  }
+  return rows.join('\n');
+}
+
+const PARTITIONS = [
+  'PartitionName=batch AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL AllocNodes=ALL Default=YES QoS=N/A DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO MaxNodes=UNLIMITED MaxTime=2-00:00:00 MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED Nodes=bcm-dgxa100-[0002-0003,0005-0020] PriorityJobFactor=1 PriorityTier=1 RootOnly=NO ReqResv=NO OverSubscribe=NO OverTimeLimit=NONE PreemptMode=OFF State=UP TotalCPUs=4608 TotalNodes=18',
+  'PartitionName=short AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL AllocNodes=ALL Default=NO QoS=shortqos DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO MaxNodes=UNLIMITED MaxTime=04:00:00 MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED Nodes=bcm-dgxa100-[0001,0004] PriorityJobFactor=1 PriorityTier=1 RootOnly=NO ReqResv=NO OverSubscribe=NO OverTimeLimit=NONE PreemptMode=OFF State=UP TotalCPUs=512 TotalNodes=2',
+];
+const QOS = { shortqos: { Name: 'shortqos', MaxJobsPU: '1', MaxSubmitPU: '', MaxTRESPU: 'cpu=32,gres/gpu=2,mem=256G', MaxWall: '' } };
+
+let r;
+if (/\|\s*sbatch\b/.test(cmd) || /^sbatch\s/.test(cmd)) {
+  if (scenario === 'sbatch_fail') {
+    out('', 1, 'sbatch: error: Batch job submission failed: Invalid account or account/partition combination specified');
+  }
+  out(`Submitted batch job ${JOB_IDS[scenario] || '541806'}`);
+} else if ((r = cmd.match(/^sacct -j ([\d,]+) --format=JobID%-20,State -P -n$/))) {
+  out(sacctPollRows(r[1].split(',')));
+} else if (/^sacct -u /.test(cmd)) {
+  out('', 1); // resource history: `| grep COMPLETED` matched nothing
+} else if ((r = cmd.match(/^sacct -j '([^']+)' --format=StdOut/))) {
+  out(`/home/u/proj/results/logs/slurm_${r[1]}.out`);
+} else if ((r = cmd.match(/^sacct -j '([^']+)'$/))) {
+  out(['JobID           JobName  Partition    Account  AllocCPUS      State ExitCode',
+    '------------ ---------- ---------- ---------- ---------- ---------- --------',
+    `${r[1]}          train      batch       acct          8  COMPLETED      0:0`].join('\n'));
+} else if (/\|\s*wc -l$/.test(cmd) && /^squeue\b/.test(cmd)) {
+  out(process.env.FAKE_SQUEUE_COUNT || '0');
+} else if (/^squeue\b/.test(cmd)) {
+  out('             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)');
+} else if (/^sinfo -s$/.test(cmd)) {
+  out(['PARTITION AVAIL  TIMELIMIT   NODES(A/I/O/T) NODELIST',
+    'batch*       up 2-00:00:00        15/0/3/18 bcm-dgxa100-[0002-0003,0005-0020]',
+    'short        up    4:00:00          2/0/0/2 bcm-dgxa100-[0001,0004]'].join('\n'));
+} else if (/^scontrol show partition\b/.test(cmd)) {
+  if (/\s-o\b/.test(cmd)) out(PARTITIONS.join('\n'));
+  out(PARTITIONS.map(p => p.split(' ').join('\n   ')).join('\n\n'));
+} else if ((r = cmd.match(/^sacctmgr show qos where name=(\S+) -P -n format=(\S+)$/))) {
+  const fields = r[2].split(',');
+  out(r[1].split(',').filter(n => QOS[n]).map(n => fields.map(f => QOS[n][f] ?? '').join('|')).join('\n'));
+} else if (/^hostname$/.test(cmd)) {
+  out('slogin-01');
+} else if ((r = cmd.match(/^scancel '([^']+)' && echo "(.*)"$/))) {
+  out(r[2]);
+} else if (/^(tail|head) -n \d+ '/.test(cmd) || /^cat '/.test(cmd)) {
+  out('epoch 1 loss 0.9\nepoch 2 loss 0.5');
+} else if (/^ls\b/.test(cmd)) {
+  out('a.txt\nb.txt');
+} else {
+  out(''); // mkdir, cd, rm, ...: silent success
+}

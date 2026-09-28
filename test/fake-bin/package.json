@@ -1,0 +1,4 @@
+{
+  "//": "Extensionless fake binaries are CommonJS on every Node version (the repo root is type: module).",
+  "type": "commonjs"
+}

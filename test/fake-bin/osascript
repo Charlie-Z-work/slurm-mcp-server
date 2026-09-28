@@ -1,0 +1,3 @@
+#!/bin/sh
+# Test stub: swallow desktop notifications so the suite never pops macOS alerts.
+exit 0

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Test stub: swallow desktop notifications so the suite never pops desktop alerts.
+exit 0

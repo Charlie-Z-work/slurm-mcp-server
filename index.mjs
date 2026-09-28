@@ -443,7 +443,8 @@ function formatWatchStatus(watches) {
 }
 
 // Polling loop — async, non-blocking, per-tty filtering
-const POLL_INTERVAL = 30_000;
+// SLURM_MCP_POLL_MS: test hook to shorten the cycle (default unchanged: 30s).
+const POLL_INTERVAL = Number(process.env.SLURM_MCP_POLL_MS) > 0 ? Number(process.env.SLURM_MCP_POLL_MS) : 30_000;
 const POLL_BACKOFF_MAX = 600_000; // 10 min cap under sustained failure
 let consecutivePollFailures = 0;
 
@@ -1814,20 +1815,33 @@ server.tool('slurm_watches', 'List active SLURM job watches and pending notifica
   }
 });
 
-// Start watch polling loop
-startWatchPolling();
+// SLURM_MCP_NO_START=1: import for unit tests without starting the poller,
+// the stdin lifecycle hooks or the stdio transport (pure helpers only).
+if (process.env.SLURM_MCP_NO_START !== '1') {
+  // Start watch polling loop
+  startWatchPolling();
 
-// Lifecycle: a stdio MCP server must die with its client. Without these, the
-// setTimeout polling chain keeps the event loop alive forever after the
-// Claude session exits (2026-07-02: 28 zombie servers from 3 weeks found).
-function shutdown() {
-  // Remove our heartbeat so other pollers can adopt our watches immediately.
-  try { unlinkSync(join(HEARTBEAT_DIR, `${windowTty}.json`)); } catch {}
-  process.exit(0);
+  // Lifecycle: a stdio MCP server must die with its client. Without these, the
+  // setTimeout polling chain keeps the event loop alive forever after the
+  // Claude session exits (2026-07-02: 28 zombie servers from 3 weeks found).
+  function shutdown() {
+    // Remove our heartbeat so other pollers can adopt our watches immediately.
+    try { unlinkSync(join(HEARTBEAT_DIR, `${windowTty}.json`)); } catch {}
+    process.exit(0);
+  }
+  process.stdin.on('end', () => { logDebug('stdin closed, exiting.'); shutdown(); });
+  process.stdin.on('close', () => { logDebug('stdin closed, exiting.'); shutdown(); });
+  process.stdin.on('error', () => shutdown());
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
 }
-process.stdin.on('end', () => { logDebug('stdin closed, exiting.'); shutdown(); });
-process.stdin.on('close', () => { logDebug('stdin closed, exiting.'); shutdown(); });
-process.stdin.on('error', () => shutdown());
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+export {
+  parseSacctJobId, countTasksInKey, summarizeJobRows, baseState, isTerminalState, TERMINAL_STATES,
+  parseSlurmTime, parseElapsed, parseResourceHistory, formatRecommendation, checkResourceWaste,
+  memToMB, parseTres, validateSubmitArgs, RE_JOB_NAME, RE_PARTITION, RE_MEM, RE_ARRAY, RE_DEPENDENCY,
+  VALID_JOB_ID, validateJobId, validatePath, validateSession, UNSAFE_PATH,
+  guardCommand, BLOCKED_PATTERNS, MAX_CMD_LENGTH, compressOutput,
+  atomicWriteJson, readJsonOrQuarantine, withFileLock,
+};

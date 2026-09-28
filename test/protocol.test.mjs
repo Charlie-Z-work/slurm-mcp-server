@@ -321,7 +321,7 @@ describe('normal scenario', async () => {
     const r = await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x', remote_path: '~/x' });
     assert.equal(r.isError, false, r.text);
     const rs = s.logEntries().filter(e => e.kind === 'rsync').at(-1);
-    assert.deepEqual(rs.argv, ['-avz', '--partial', '-e', 'ssh -o BatchMode=yes -o ControlPath=/tmp/fake-cm/fake -o ProxyCommand=false', '--', '/tmp/x', 'fake:~/x']);
+    assert.deepEqual(rs.argv, ['-avz', '--partial', '-s', '-e', 'ssh -o BatchMode=yes -o ControlPath=/tmp/fake-cm/fake -o ProxyCommand=false', '--', '/tmp/x', 'fake:~/x']);
     await s.call('sync_files', { direction: 'download', local_path: '/tmp/y', remote_path: '-evil' });
     assert.deepEqual(s.logEntries().filter(e => e.kind === 'rsync').at(-1).argv.slice(-3), ['--', 'fake:-evil', '/tmp/y'], 'paths after "--" (R12)');
     assert.equal((await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x;rm', remote_path: '~' })).isError, true);
@@ -853,9 +853,11 @@ describe('watch expiry only counts successful polls (R4)', () => {
       const first = s.readWatches()[0].unseenSince;
       await new Promise(res => setTimeout(res, 700));
       assert.equal(s.readWatches()[0].unseenSince, first, 'not reset by later polls');
-      // An entry whose unseenSince is older than the TTL is expired.
-      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'gone', unseenSince: new Date(Date.now() - 49 * 3600_000).toISOString() })]));
-      assert.match((await s.call('slurm_watches')).text, /\(no watches for this window\)/);
+      // An entry whose unseenSince is older than the TTL is expired by the
+      // next continuous successful poll that still misses the job (F2).
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'gone', unseenSince: new Date(Date.now() - 49 * 3600_000).toISOString(), lastQueriedAt: new Date().toISOString() })]));
+      const gone = await waitFor(async () => ({ ok: s.readWatches().length === 0 }));
+      assert.ok(gone.ok, JSON.stringify(s.readWatches()));
     } finally { await s.stop(); rmSync(s0, { recursive: true, force: true }); }
   });
 });
@@ -995,8 +997,8 @@ describe('ProxyCommand=false only in ControlMaster mode (C1)', () => {
       assert.ok(s.logEntries().some(e => e.kind === 'config' && e.argv[1] === 'fake'));
     } finally { await s.stop(); }
   });
-  test('unresolvable ControlPath: plain BatchMode, never ProxyCommand=false without a pinned path', async () => {
-    const s = await startServer({ env: { FAKE_CONTROLPATH: 'none', SLURM_MCP_POLL_MS: '600000' } });
+  test('unresolvable ControlPath with HPC_ALLOW_UNSAFE_REUSE=1: plain BatchMode, never ProxyCommand=false without a pinned path', async () => {
+    const s = await startServer({ env: { FAKE_CONTROLPATH: 'none', HPC_ALLOW_UNSAFE_REUSE: '1', SLURM_MCP_POLL_MS: '600000' } });
     try {
       const r = await s.call('ssh_exec', { command: 'ls /home/u' });
       assert.equal(r.text, 'a.txt\nb.txt');
@@ -1125,5 +1127,395 @@ describe('small portability fixes (C8, C9, C10, C12)', async () => {
     const c = await s.call('slurm_cancel', { job_id: '541806+1' });
     assert.equal(c.isError, false, c.text);
     assert.ok(execs(s).some(e => e.cmd.startsWith("scancel '541806+1'")));
+  });
+});
+
+// ---- Final review fixes (F1-F10) ----
+
+describe('ControlPath unresolvable → fail-local (F1)', () => {
+  const remote = (s) => s.logEntries().filter(e => ['exec', 'write', 'rsync'].includes(e.kind));
+  const cases = [
+    ['ssh -G reports a %C path', { FAKE_CONTROLPATH: '/tmp/fake-cm/%C' }, /unexpanded "%" token/],
+    ['ssh -G reports a path with a quote', { FAKE_CONTROLPATH: '/tmp/fake"cm/x' }, /quotes, backslashes, tabs/],
+    ['ssh -G fails', { FAKE_SSH_G_FAIL: '1' }, /ssh -G fake failed: ssh: .*Bad configuration option/],
+  ];
+  for (const [name, env, why] of cases) {
+    test(`${name}: every tool and the poller refuse, zero remote exec`, async () => {
+      const s = await startServer({ env });
+      try {
+        const tty = await s.tty();
+        writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'cp' })]));
+        for (const [tool, args] of [['ssh_exec', { command: 'ls' }], ['ssh_write_file', { path: '/home/u/f', content: 'x' }],
+          ['sync_files', { direction: 'upload', local_path: '/tmp/x', remote_path: '~/x' }], ['slurm_submit', { script: 'echo hi', job_name: 'cp' }]]) {
+          const r = await s.call(tool, args);
+          assert.equal(r.isError, true, `${tool}: ${r.text}`);
+          assert.match(r.text, /ControlMaster detected but its ControlPath could not be resolved safely \(.*\); refusing to open a new connection\. Set HPC_ALLOW_UNSAFE_REUSE=1 to override/, tool);
+          assert.match(r.text, why, tool);
+        }
+        const polled = await waitFor(async () => {
+          const w = await s.call('slurm_watches');
+          return { ok: /Last poll error: .*refusing to open a new connection/.test(w.text), text: w.text };
+        });
+        assert.ok(polled.ok, polled.text);
+        assert.deepEqual(remote(s), [], 'no remote exec / write / rsync');
+        assert.ok(s.logEntries().some(e => e.kind === 'config'), 'the ControlPath was looked up locally');
+      } finally { await s.stop(); }
+    });
+  }
+  test('a ControlPath with a space is usable: quoted for ssh -o and for rsync -e', async () => {
+    const s = await startServer({ env: { FAKE_CONTROLPATH: '/tmp/fake cm/x', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      assert.equal((await s.call('ssh_exec', { command: 'ls' })).text, 'a.txt\nb.txt');
+      assert.deepEqual(execs(s).at(-1).argv.slice(0, 7), ['-o', 'BatchMode=yes', '-o', 'ControlPath="/tmp/fake cm/x"', '-o', 'ProxyCommand=false', 'fake']);
+      await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x', remote_path: '~/x' });
+      const rs = s.logEntries().filter(e => e.kind === 'rsync').at(-1);
+      assert.equal(rs.argv[rs.argv.indexOf('-e') + 1], `ssh -o BatchMode=yes -o 'ControlPath="/tmp/fake cm/x"' -o ProxyCommand=false`);
+    } finally { await s.stop(); }
+  });
+  test('HPC_ALLOW_UNSAFE_REUSE=1 lets the call through with plain BatchMode', async () => {
+    const s = await startServer({ env: { FAKE_CONTROLPATH: '/tmp/fake-cm/%C', HPC_ALLOW_UNSAFE_REUSE: '1', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      assert.equal((await s.call('ssh_exec', { command: 'ls' })).text, 'a.txt\nb.txt');
+      assert.deepEqual(execs(s).at(-1).argv.slice(0, 3), ['-o', 'BatchMode=yes', 'fake']);
+    } finally { await s.stop(); }
+  });
+  test('HPC_REQUIRE_MASTER=1 ignores the override', async () => {
+    const s = await startServer({ env: { FAKE_SSH_G_FAIL: '1', HPC_ALLOW_UNSAFE_REUSE: '1', HPC_REQUIRE_MASTER: '1', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const r = await s.call('ssh_exec', { command: 'ls' });
+      assert.equal(r.isError, true);
+      assert.match(r.text, /refusing to open a new connection.*not honored while HPC_REQUIRE_MASTER=1/);
+      assert.deepEqual(remote(s), []);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('watch expiry is decided at poll time only (F2)', () => {
+  const old = () => new Date(Date.now() - 3 * 24 * 3600_000).toISOString();
+  test('absent once → 3 days → master dead → reconnect: job RUNNING again, watch kept and finally notifies', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'slurm-mcp-f2-'));
+    const dead = join(dir, 'dead'); const gate = join(dir, 'done');
+    writeFileSync(dead, '');
+    const s = await startServer({ env: { FAKE_DEAD_FILE: dead, FAKE_RUNNING_UNTIL: gate } });
+    try {
+      const tty = await s.tty();
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'outage', submittedAt: old(), unseenSince: old(), lastQueriedAt: old() })]));
+      const deadRounds = await waitFor(async () => {
+        const w = await s.call('slurm_watches');
+        return { ok: /Last poll error: SSH master to fake is dead/.test(w.text), text: w.text };
+      });
+      assert.ok(deadRounds.ok, deadRounds.text);
+      assert.match(deadRounds.text, /541806 \(outage\) \[PENDING\]/, 'not expired while the master is dead');
+      assert.equal(s.readWatches().length, 1);
+      rmSync(dead);
+      const running = await waitFor(async () => {
+        const w = s.readWatches()[0];
+        return { ok: w?.state === 'RUNNING' && w.unseenSince === undefined, w };
+      }, { timeout: 15_000 });
+      assert.ok(running.ok, JSON.stringify(running.w));
+      writeFileSync(gate, '');
+      const done = await waitFor(async () => {
+        const w = await s.call('slurm_watches');
+        return { ok: /SLURM job 541806 \(outage\) COMPLETED/.test(w.text), text: w.text };
+      });
+      assert.ok(done.ok, done.text);
+    } finally { await s.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('long outage, still absent after reconnect: first poll only restarts the clock', async () => {
+    const s = await startServer({ env: { FAKE_SACCT_MISSING: '541806' } });
+    try {
+      const tty = await s.tty();
+      const unseen = old();
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'gap', submittedAt: old(), unseenSince: unseen, lastQueriedAt: old() })]));
+      const r = await waitFor(async () => {
+        const w = s.readWatches()[0];
+        return { ok: w && w.unseenSince !== unseen, w };
+      });
+      assert.ok(r.ok, JSON.stringify(r.w));
+      assert.ok(Date.now() - Date.parse(r.w.unseenSince) < 60_000, 'unseenSince restarted');
+      await new Promise(res => setTimeout(res, 800)); // several more polls
+      assert.equal(s.readWatches().length, 1, 'kept: absence clock restarted');
+    } finally { await s.stop(); }
+  });
+  test('master dead with a TTL-old unseenSince: kept; reconnect and still absent → deleted', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'slurm-mcp-f2b-'));
+    const dead = join(dir, 'dead');
+    writeFileSync(dead, '');
+    const s = await startServer({ env: { FAKE_DEAD_FILE: dead, FAKE_SACCT_MISSING: '541806' } });
+    try {
+      const tty = await s.tty();
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'vanished', submittedAt: old(), unseenSince: old(), lastQueriedAt: new Date().toISOString() })]));
+      const deadRounds = await waitFor(async () => {
+        const w = await s.call('slurm_watches');
+        return { ok: /Last poll error: SSH master to fake is dead/.test(w.text), text: w.text };
+      });
+      assert.ok(deadRounds.ok, deadRounds.text);
+      assert.match(deadRounds.text, /541806 \(vanished\)/, 'loading never expires');
+      assert.equal(s.readWatches().length, 1);
+      rmSync(dead);
+      const gone = await waitFor(async () => ({ ok: s.readWatches().length === 0 }), { timeout: 15_000 });
+      assert.ok(gone.ok, JSON.stringify(s.readWatches()));
+      assert.match(s.stderr(), /Watch 541806 on fake expired: not reported by sacct since/);
+    } finally { await s.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('"%" in the final log directory (F4)', () => {
+  test('workdir_set rejects "%"; a stored legacy workdir with "%" blocks submit before sbatch', async () => {
+    const s = await startServer({ env: { SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const w = await s.call('workdir_set', { path: '/home/u/run_%j' });
+      assert.equal(w.isError, true);
+      assert.match(w.text, /must not contain "%"/);
+      const tty = await s.tty();
+      mkdirSync(join(s.home, '.claude', 'hpc-workdirs'), { recursive: true });
+      writeFileSync(join(s.home, '.claude', 'hpc-workdirs', `${tty}.json`), JSON.stringify({ tty, workdir: '/home/u/run_%A', setAt: 'x' }));
+      const r = await s.call('slurm_submit', { script: 'echo hi', job_name: 'pct' });
+      assert.equal(r.isError, true, r.text);
+      assert.match(r.text, /Submit rejected: log directory "\/home\/u\/run_%A\/results\/logs" contains "%"/);
+      assert.equal(submitCmd(s), undefined, 'no sbatch');
+    } finally { await s.stop(); }
+  });
+});
+
+describe('rsync protect-args and remote_path whitespace (F5)', () => {
+  test('-s when the local rsync supports it; remote_path with whitespace rejected before rsync', async () => {
+    const s = await startServer({ env: { SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      await s.call('sync_files', { direction: 'download', local_path: '/tmp/y', remote_path: '~/data/' });
+      const rs = s.logEntries().filter(e => e.kind === 'rsync');
+      assert.equal(rs.length, 1);
+      assert.deepEqual(rs[0].argv.slice(0, 3), ['-avz', '--partial', '-s']);
+      for (const remote_path of ['~/my data', '~/a\tb', ' ~/x']) {
+        const r = await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x', remote_path });
+        assert.equal(r.isError, true, remote_path);
+        assert.match(r.text, /remote_path contains (whitespace|unsafe characters)/);
+      }
+      assert.equal(s.logEntries().filter(e => e.kind === 'rsync').length, 1, 'no rsync for rejected paths');
+    } finally { await s.stop(); }
+  });
+  test('openrsync without -s: argv has no -s, sync still works', async () => {
+    const s = await startServer({ env: { FAKE_RSYNC_NO_S: '1', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const r = await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x', remote_path: '~/x' });
+      assert.equal(r.isError, false, r.text);
+      const rs = s.logEntries().filter(e => e.kind === 'rsync').at(-1);
+      assert.deepEqual(rs.argv.slice(0, 3), ['-avz', '--partial', '-e']);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('sites without Slurm accounting (F6)', () => {
+  test('submit warns and registers no watch; slurm_watches shows the reason', async () => {
+    const s = await startServer({ scenario: 'sacct_disabled' });
+    try {
+      const r = await s.call('slurm_submit', { script: 'echo hi', job_name: 'noacct' });
+      assert.equal(r.isError, false, r.text);
+      assert.match(r.text, /Submitted batch job 541806/);
+      assert.match(r.text, /⚠️ sacct unavailable on this cluster — job watches cannot complete; use slurm_status 541806/);
+      assert.doesNotMatch(r.text, /Watch registered/);
+      assert.ok(!existsSync(s.watchesFile) || s.readWatches().length === 0, 'no watch');
+      const w = await s.call('slurm_watches');
+      assert.match(w.text, /sacct unavailable on this cluster.*\(fake: sacct: error: Slurm accounting storage is disabled\)/);
+    } finally { await s.stop(); }
+  });
+  test('the poller detects it from a watch registered before (e.g. by another window)', async () => {
+    const s = await startServer({ scenario: 'sacct_disabled' });
+    try {
+      const tty = await s.tty();
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'before' })]));
+      const r = await waitFor(async () => {
+        const w = await s.call('slurm_watches');
+        return { ok: /sacct unavailable on this cluster — job watches cannot complete; use slurm_status \(fake: /.test(w.text), text: w.text };
+      });
+      assert.ok(r.ok, r.text);
+      const f = await s.call('slurm_submit_file', { path: '/home/u/job.sh' });
+      assert.match(f.text, /sacct unavailable on this cluster/);
+      assert.equal(s.readWatches().length, 1, 'only the old watch');
+    } finally { await s.stop(); }
+  });
+});
+
+describe('invalid time fields are repaired and persisted (F7)', () => {
+  test('garbage submittedAt: persisted as a real date, so the orphan grace can elapse', async () => {
+    const s = await startServer();
+    try {
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty: 'ttys-gone', jobName: 'badtime', submittedAt: 'yesterday-ish', unseenSince: 'nope' })]));
+      const r = await waitFor(async () => {
+        const w = s.readWatches()[0];
+        return { ok: w && Number.isFinite(Date.parse(w.submittedAt)) && Number.isFinite(Date.parse(w.unseenSince)), w };
+      });
+      assert.ok(r.ok, JSON.stringify(r.w));
+      assert.match(s.stderr(), /invalid submittedAt "yesterday-ish", treated as now/);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('watches of unconfigured hosts (F8)', () => {
+  test('never polled, probed or adopted; slurm_watches says "not configured"', async () => {
+    const s = await startServer({ env: { FAKE_SCENARIO_BY_HOST: 'stranger:normal' } });
+    try {
+      const tty = await s.tty();
+      const old = new Date(Date.now() - 3600_000).toISOString();
+      writeFileSync(s.watchesFile, JSON.stringify([
+        seedWatch({ tty, host: 'stranger', jobName: 'mine-stranger' }),
+        seedWatch({ tty: 'ttys-gone', host: 'stranger', jobId: '541807', jobName: 'orphan-stranger', submittedAt: old }),
+      ]));
+      const polls = await waitFor(async () => {
+        const w = await s.call('slurm_watches');
+        const n = Number(w.text.match(/#(\d+)\)/)?.[1] || 0);
+        return { ok: n >= 5, text: w.text };
+      });
+      assert.ok(polls.ok, polls.text);
+      assert.match(polls.text, /541806 \(mine-stranger\) .*host stranger not configured \(not in HPC_HOST\), not polled/);
+      assert.deepEqual(s.logEntries().filter(e => e.argv.includes('stranger')), [], 'zero ssh toward the unknown host');
+      assert.equal(s.readWatches().find(w => w.jobId === '541807').tty, 'ttys-gone', 'not adopted');
+    } finally { await s.stop(); }
+  });
+});
+
+describe('tty whitelist in the watch file (F9)', () => {
+  test('a "../" tty is dropped before it can reach a heartbeat path', async () => {
+    const s = await startServer({ env: { SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty: '../../evil', jobName: 'evil' })]));
+      const w = await s.call('slurm_watches');
+      assert.doesNotMatch(w.text, /Other windows/);
+      assert.match(s.stderr(), /Ignoring malformed watch entry/);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('legacy workdir file (F10)', () => {
+  test('{tty, workdir} without host: submit writes cd -- \'<dir>\'', async () => {
+    const s = await startServer({ env: { SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const tty = await s.tty();
+      mkdirSync(join(s.home, '.claude', 'hpc-workdirs'), { recursive: true });
+      writeFileSync(join(s.home, '.claude', 'hpc-workdirs', `${tty}.json`), JSON.stringify({ tty, workdir: '/home/u/legacy-proj' }));
+      const r = await s.call('slurm_submit', { script: 'echo hi', job_name: 'leg' });
+      assert.equal(r.isError, false, r.text);
+      const cmd = submitCmd(s);
+      assert.ok(cmd.includes("\ncd -- '/home/u/legacy-proj' || exit 1\n"), cmd);
+      assert.ok(cmd.includes('#SBATCH --output=/home/u/legacy-proj/results/logs/slurm_%j.out'), cmd);
+    } finally { await s.stop(); }
+  });
+});
+
+// ---- Final review, Gemini items (G1-G7) ----
+
+describe('slurm_logs: "(null)" StdOut falls through to scontrol (G1)', () => {
+  test('sacct "(null)" is not read as a path', async () => {
+    const s = await startServer({ env: { FAKE_STDOUT: 'null', FAKE_SCONTROL_STDOUT: '/w/logs/slurm_541806.out', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const r = await s.call('slurm_logs', { job_id: '541806', lines: 5 });
+      assert.equal(r.isError, false, r.text);
+      assert.ok(execs(s).some(e => e.cmd === "tail -n 5 '/w/logs/slurm_541806.out'"), JSON.stringify(execs(s).map(e => e.cmd)));
+      assert.ok(!execs(s).some(e => /\(null\)/.test(e.cmd) && /^(tail|cat) /.test(e.cmd)));
+    } finally { await s.stop(); }
+  });
+});
+
+describe('ssh_write_file with empty content (G2)', () => {
+  test('content "" writes an empty file', async () => {
+    const s = await startServer({ env: { SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      const r = await s.call('ssh_write_file', { path: '/home/u/empty', content: '' });
+      assert.equal(r.isError, false, r.text);
+      assert.match(r.text, /Written 0 bytes → \/home\/u\/empty/);
+      const w = s.logEntries().filter(e => e.kind === 'write').at(-1);
+      assert.equal(w.path, '/home/u/empty');
+      assert.equal(w.bytes, 0);
+      const none = await s.call('ssh_write_file', { path: '/home/u/x' });
+      assert.equal(none.isError, true);
+      assert.match(none.text, /provide either content or from_file/);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('large sacct output in the poller (G4)', () => {
+  test('6 MB of sacct rows: the watch still completes', async () => {
+    const s = await startServer({ env: { FAKE_SACCT_PAD_MB: '6' } });
+    try {
+      const tty = await s.tty();
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'big' })]));
+      const done = await waitFor(async () => {
+        const w = await s.call('slurm_watches');
+        return { ok: /SLURM job 541806 \(big\) COMPLETED/.test(w.text), text: w.text };
+      }, { timeout: 15_000 });
+      assert.ok(done.ok, done.text);
+    } finally { await s.stop(); }
+  });
+  test('over 32 MB: readable lastPollError, watch kept, server alive', async () => {
+    const s = await startServer({ env: { FAKE_SACCT_PAD_MB: '40' } });
+    try {
+      const tty = await s.tty();
+      writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobName: 'huge' })]));
+      const r = await waitFor(async () => {
+        const w = await s.call('slurm_watches');
+        return { ok: /Last poll error: batch sacct \(fake\): output exceeded 32 MB \(1 watched job\(s\) in one sacct query\)/.test(w.text), text: w.text };
+      }, { timeout: 20_000 });
+      assert.ok(r.ok, r.text);
+      assert.match(r.text, /541806 \(huge\)/);
+    } finally { await s.stop(); }
+  });
+});
+
+describe('per-cluster submit defaults (G5)', () => {
+  test('SLURM_DEFAULT_PARTITION / SLURM_DEFAULT_GPUS lists follow HPC_HOST order', async () => {
+    const s = await startServer({ env: { HPC_HOST: 'fake,other', SLURM_DEFAULT_PARTITION: 'batch,standard-s', SLURM_DEFAULT_GPUS: '1,0', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      await s.call('slurm_submit', { script: 'echo hi', job_name: 'p1' });
+      let cmd = submitCmd(s);
+      assert.ok(cmd.includes('\n#SBATCH --partition=batch\n') && cmd.includes('\n#SBATCH --gres=gpu:1\n'), cmd);
+      await s.call('cluster_switch', { host: 'other' });
+      await s.call('slurm_submit', { script: 'echo hi', job_name: 'p2' });
+      cmd = execs(s).map(e => e.cmd).filter(c => /\| sbatch/.test(c)).at(-1);
+      assert.ok(cmd.includes('\n#SBATCH --partition=standard-s\n'), cmd);
+      assert.ok(!/--gres/.test(cmd), cmd);
+    } finally { await s.stop(); }
+  });
+  test('a single value applies to every cluster', async () => {
+    const s = await startServer({ env: { HPC_HOST: 'fake,other', SLURM_DEFAULT_PARTITION: 'gpu.a100', SLURM_MCP_POLL_MS: '600000' } });
+    try {
+      await s.call('cluster_switch', { host: 'other' });
+      await s.call('slurm_submit', { script: 'echo hi', job_name: 'p3' });
+      assert.ok(submitCmd(s).includes('\n#SBATCH --partition=gpu.a100\n'));
+    } finally { await s.stop(); }
+  });
+});
+
+describe('manual ssh success ends the poller backoff (G7)', () => {
+  // Waits until the host's backoff has just grown to 8s, so without the fix
+  // the next poll attempt would be ~8s away.
+  async function backOff(s, dead) {
+    writeFileSync(dead, '');
+    const r = await waitFor(async () => {
+      const w = await s.call('slurm_watches');
+      return { ok: /SSH master to fake is dead.*backoff (8|16|32)s/.test(w.text), text: w.text };
+    }, { timeout: 20_000, every: 50 });
+    assert.ok(r.ok, r.text);
+    rmSync(dead);
+  }
+  test('ssh_status (alive) and ssh_exec clear the host backoff', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'slurm-mcp-g7-'));
+    const dead = join(dir, 'dead');
+    const s = await startServer({ env: { FAKE_DEAD_FILE: dead } });
+    try {
+      const tty = await s.tty();
+      for (const [tool, args, jobId] of [['ssh_status', {}, '541806'], ['ssh_exec', { command: 'ls' }, '541807']]) {
+        writeFileSync(s.watchesFile, JSON.stringify([seedWatch({ tty, jobId, jobName: `via-${tool}` })]));
+        await backOff(s, dead);
+        const t0 = Date.now();
+        const r = await s.call(tool, args);
+        assert.equal(r.isError, false, r.text);
+        const done = await waitFor(async () => {
+          const w = await s.call('slurm_watches');
+          return { ok: new RegExp(`SLURM job ${jobId} \\(via-${tool}\\) COMPLETED`).test(w.text), text: w.text };
+        }, { timeout: 15_000, every: 50 });
+        assert.ok(done.ok, done.text);
+        assert.ok(Date.now() - t0 < 3000, `${tool}: watch resumed after ${Date.now() - t0}ms`);
+      }
+    } finally { await s.stop(); rmSync(dir, { recursive: true, force: true }); }
   });
 });

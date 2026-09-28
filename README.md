@@ -26,8 +26,8 @@ export HPC_USER=your-username       # Your cluster username (used for squeue/sac
 # Optional:
 export SLURM_ACCOUNT=your-account   # SLURM account; unset = no #SBATCH --account (site default)
 export HPC_PREAMBLE='module load python/3.11\nconda activate myenv'
-export SLURM_DEFAULT_PARTITION=batch  # default partition for slurm_submit
-export SLURM_DEFAULT_GPUS=1           # sites without GPUs: set SLURM_DEFAULT_GPUS=0
+export SLURM_DEFAULT_PARTITION=batch  # default partition for slurm_submit (per-cluster list allowed)
+export SLURM_DEFAULT_GPUS=1           # sites without GPUs: set SLURM_DEFAULT_GPUS=0 (per-cluster list allowed)
 ```
 
 Values are validated at startup (the server exits with an error otherwise);
@@ -39,6 +39,9 @@ none may start with `-`, and comma-separated lists configure multiple clusters:
 - `SLURM_ACCOUNT`: letters, digits, `_ . -`; an empty list entry means "no
   account" for that cluster (`acct1,,acct3`)
 - `SLURM_DEFAULT_PARTITION`: letters, digits, `_ . -` (e.g. `gpu.a100`)
+- `SLURM_DEFAULT_PARTITION` / `SLURM_DEFAULT_GPUS`: one value for every
+  cluster, or a list in `HPC_HOST` order (`batch,standard-s`, `1,0`); a shorter
+  list reuses its last entry, an empty entry means the built-in default
 
 ### 2. Add to your MCP client
 
@@ -113,7 +116,7 @@ Add to `.cursor/mcp.json` in your project root:
 
 This is a standard MCP server using stdio transport. Configure it in your client with:
 - **Command**: `npx -y slurm-mcp-server`
-- **Environment variables**: `HPC_HOST`, `HPC_USER` (required), `SLURM_ACCOUNT`, `HPC_PREAMBLE`, `NOTIFY_WEBHOOK`, `HPC_RESOURCE_LOG`, `HPC_GUIDE_EXTRA`, `SLURM_DEFAULT_PARTITION`, `SLURM_DEFAULT_GPUS`, `HPC_REQUIRE_MASTER` (optional)
+- **Environment variables**: `HPC_HOST`, `HPC_USER` (required), `SLURM_ACCOUNT`, `HPC_PREAMBLE`, `NOTIFY_WEBHOOK`, `HPC_RESOURCE_LOG`, `HPC_GUIDE_EXTRA`, `SLURM_DEFAULT_PARTITION`, `SLURM_DEFAULT_GPUS`, `HPC_REQUIRE_MASTER`, `HPC_ALLOW_UNSAFE_REUSE` (optional)
 </details>
 
 ### 3. Restart your client
@@ -213,9 +216,10 @@ Start a tmux-based interactive SSH session for commands needing 2FA, confirmatio
 | `NOTIFY_WEBHOOK` | ❌ | Slack/Discord webhook URL for job completion alerts |
 | `HPC_RESOURCE_LOG` | ❌ | Path **on the cluster** to an extra resource log (e.g. TSV of past runs) that `resource_check` greps by job name |
 | `HPC_GUIDE_EXTRA` | ❌ | Local path to a site-specific guide appended to the `guide` tool output (accounts, partition policy, envs) |
-| `SLURM_DEFAULT_PARTITION` | ❌ | Default `partition` for `slurm_submit` (default `batch`) |
-| `SLURM_DEFAULT_GPUS` | ❌ | Default `gpus` for `slurm_submit` (default `1`). Sites without GPUs: set `SLURM_DEFAULT_GPUS=0` (no `--gres` line) |
+| `SLURM_DEFAULT_PARTITION` | ❌ | Default `partition` for `slurm_submit` (default `batch`). Comma-separated list = one per cluster, `HPC_HOST` order |
+| `SLURM_DEFAULT_GPUS` | ❌ | Default `gpus` for `slurm_submit` (default `1`). Sites without GPUs: set `SLURM_DEFAULT_GPUS=0` (no `--gres` line). Comma-separated list = one per cluster |
 | `HPC_REQUIRE_MASTER` | ❌ | `1` = require a ControlMaster: a host without `ControlPath` is treated like a dead master (fail fast, no direct connection). Recommended on MFA clusters |
+| `HPC_ALLOW_UNSAFE_REUSE` | ❌ | `1` = when the master is alive but its `ControlPath` cannot be resolved safely via `ssh -G`, run calls with plain `BatchMode=yes` instead of refusing them (a new connection is opened if the master dies meanwhile). Ignored under `HPC_REQUIRE_MASTER=1` |
 
 ## SSH Setup
 
@@ -245,8 +249,11 @@ the call, ssh cannot reuse it and fails locally instead of opening a new
 connection (a doomed publickey attempt that would feed the bastion's
 fail2ban). The effective `ControlPath` (read locally with `ssh -G <host>`) is
 passed explicitly as well, because a `%C` socket name hashes the `ProxyJump`
-value and would otherwise change; if it cannot be resolved, calls run with
-`BatchMode=yes` only. Set `HPC_REQUIRE_MASTER=1` so that a
+value and would otherwise change. If it cannot be resolved safely (`ssh -G`
+fails, or the path contains `%`, quotes, backslashes or tabs), every call is
+refused locally — nothing is sent — unless `HPC_ALLOW_UNSAFE_REUSE=1`
+(plain `BatchMode=yes`). Paths with plain spaces work (quoted for ssh and for
+`rsync -e`). Set `HPC_REQUIRE_MASTER=1` so that a
 missing `ControlPath` is also treated as "dead" instead of falling back to
 mode 2.
 
@@ -263,6 +270,8 @@ fail2ban prefer mode 1.
 - **Windows clients are not supported.** Local paths (`sync_files`, state files under `~/.claude`), the tty detection and the ControlMaster checks assume a POSIX client (macOS / Linux).
 - **The Command Guard is not a security boundary.** It only catches quoting mistakes that break the `bash --login -c '...'` transport; `ssh_exec` runs arbitrary commands as your cluster user.
 - **GPU default.** `SLURM_DEFAULT_GPUS` defaults to `1` for backward compatibility, so on a CPU-only site every `slurm_submit` without `gpus` writes `--gres=gpu:1` and sbatch rejects it; the error then suggests `SLURM_DEFAULT_GPUS=0` / `gpus: 0`. Set `SLURM_DEFAULT_GPUS=0` on such sites.
+- **Job watches need `sacct` (Slurm accounting).** The watcher polls `sacct`; on a site without accounting storage (no slurmdbd) sacct fails, so `slurm_submit` registers no watch and says "sacct unavailable on this cluster — job watches cannot complete; use slurm_status". Check such jobs with `slurm_status`.
+- **`sync_files` and rsync `-s`.** `-s` (protect-args) is passed when the local rsync supports it; macOS' default openrsync does not, so remote paths are restricted to a whitelist (no whitespace or shell metacharacters) either way.
 - **Association-level QoS limits are not shown.** `cluster_info` and the submit hints read partition `MaxTime` and the partition QoS (`sacctmgr show qos`); limits set on your user/account association are not queried.
 
 ## License

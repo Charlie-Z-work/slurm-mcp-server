@@ -5,7 +5,7 @@
 // (see CHANGELOG, Unreleased → Fixed).
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, mkdirSync, utimesSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, mkdirSync, utimesSync, rmSync, statSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -367,6 +367,39 @@ describe('watch file hygiene (BUG-5, B5)', () => {
     assert.equal(M.isValidWatch({ jobId: '541806', host: 'mp' }), true);
     assert.equal(M.isValidWatch({ jobId: '541806', host: 'u@login.hpc.edu' }), true);
   });
+  test('isValidWatch: tty must be a plain file-name token (F9)', () => {
+    for (const tty of ['../x', 'a/b', '..\\x', '', 'a b', 3, 'ttys003\n'])
+      assert.equal(M.isValidWatch({ jobId: '5', tty }), false, JSON.stringify(tty));
+    for (const tty of ['ttys003', 'pid-1234', 'pts-3', undefined, null])
+      assert.equal(M.isValidWatch({ jobId: '5', tty }), true, JSON.stringify(tty));
+  });
+  test('normalizeWatchTimes: invalid dates become now, valid ones are kept (F7)', () => {
+    const nowIso = '2026-09-27T12:00:00.000Z';
+    const w = { jobId: '5', submittedAt: 'garbage', lastSeenAt: 12, unseenSince: 'not a date', lastQueriedAt: '2026-09-01T00:00:00Z' };
+    assert.equal(M.normalizeWatchTimes(w, nowIso), true);
+    assert.deepEqual(w, { jobId: '5', submittedAt: nowIso, lastSeenAt: nowIso, unseenSince: nowIso, lastQueriedAt: '2026-09-01T00:00:00Z' });
+    const missing = { jobId: '6' };
+    assert.equal(M.normalizeWatchTimes(missing, nowIso), true, 'missing submittedAt counts as invalid');
+    assert.deepEqual(missing, { jobId: '6', submittedAt: nowIso });
+    const ok = { jobId: '7', submittedAt: nowIso };
+    assert.equal(M.normalizeWatchTimes(ok, nowIso), false);
+  });
+  test('loadWatches never expires on load and reports repaired entries (F2, F7)', () => {
+    mkdirSync(dirname(M.WATCHES_FILE), { recursive: true });
+    const old = new Date(Date.now() - 30 * 24 * H).toISOString();
+    writeFileSync(M.WATCHES_FILE, JSON.stringify([
+      { jobId: '1', tty: 'ttyA', submittedAt: old, unseenSince: old, estimatedSeconds: 900 },
+      { jobId: '2', tty: 'ttyA', submittedAt: 'bad' },
+      { jobId: '3', tty: '../evil', submittedAt: old },
+    ]));
+    try {
+      const ws = M.loadWatches();
+      assert.deepEqual(ws.map(w => w.jobId), ['1', '2'], 'expired-looking entry kept, bad tty dropped');
+      assert.equal(ws[0].unseenSince, old);
+      assert.equal(ws.normalized, 1);
+      assert.ok(Number.isFinite(Date.parse(ws[1].submittedAt)));
+    } finally { rmSync(M.WATCHES_FILE, { force: true }); }
+  });
   test('numeric jobId is accepted, not dropped (R8)', () => {
     assert.equal(M.isValidWatch({ jobId: 541806 }), true);
     assert.equal(M.isValidWatch({ jobId: 541806, host: 'mp' }), true);
@@ -631,6 +664,44 @@ describe('heartbeat ownership (R5)', () => {
   });
 });
 
+describe('heartbeat atomic write (F3)', () => {
+  test('writeHeartbeat replaces the file by rename (new inode, no tmp left)', () => {
+    M.writeHeartbeat();
+    const name = readdirSync(M.HEARTBEAT_DIR).find(f => f.endsWith('.json'));
+    const p = join(M.HEARTBEAT_DIR, name);
+    const ino1 = statSync(p).ino;
+    M.writeHeartbeat(Date.now() + 1000);
+    const ino2 = statSync(p).ino;
+    assert.notEqual(ino2, ino1, 'rename, not an in-place rewrite');
+    assert.equal(JSON.parse(readFileSync(p, 'utf8')).pid, process.pid);
+    assert.deepEqual(readdirSync(M.HEARTBEAT_DIR).filter(f => f.includes('.tmp-')), []);
+    M.removeOwnHeartbeat();
+  });
+});
+
+describe('sacct availability (F6)', () => {
+  test('only accounting-storage / slurmdbd errors mark a host; entries expire after 1h', () => {
+    const t0 = Date.now();
+    assert.equal(M.noteSacctError('h1', 'sacct: error: Problem talking to the database: Connection refused', t0), false);
+    assert.equal(M.sacctUnavailableFor('h1', t0), null);
+    assert.equal(M.noteSacctError('h1', 'Command failed\nsacct: error: Slurm accounting storage is disabled\n', t0), true);
+    assert.equal(M.sacctUnavailableFor('h1', t0).reason, 'sacct: error: Slurm accounting storage is disabled');
+    assert.equal(M.noteSacctError('h2', 'sacct: error: slurm_persist_conn_open_without_init: failed to open persistent connection to host:slurmdbd:6819', t0), true);
+    assert.equal(M.sacctUnavailableFor('h2', t0 + 3601_000), null, 'expired');
+    assert.match(M.SACCT_UNAVAILABLE_NOTE, /^⚠️ sacct unavailable on this cluster — job watches cannot complete; use slurm_status$/);
+  });
+});
+
+describe('hostConfigured (F8)', () => {
+  test('only HPC_HOST entries count; formatWatchLine marks the others', () => {
+    assert.equal(M.hostConfigured('fake'), true);
+    assert.equal(M.hostConfigured('stranger'), false);
+    const w = { jobId: '5', jobName: 'x', state: 'PENDING', submittedAt: new Date().toISOString(), estimatedSeconds: 60 };
+    assert.doesNotMatch(M.formatWatchLine(w), /not configured/);
+    assert.match(M.formatWatchLine({ ...w, host: 'stranger' }), /host stranger not configured \(not in HPC_HOST\), not polled/);
+  });
+});
+
 describe('per-host poll backoff (R6)', () => {
   test('a failing host backs off alone; the loop keeps the base interval', () => {
     const base = M.currentPollDelay();
@@ -674,14 +745,39 @@ describe('sshOptsFor / parseControlPath (C1)', () => {
   test('ControlMaster mode pins the ControlPath and adds ProxyCommand=false; direct mode does not', () => {
     assert.deepEqual(M.sshOptsFor('alive', '/s/cm'), ['-o', 'BatchMode=yes', '-o', 'ControlPath=/s/cm', '-o', 'ProxyCommand=false']);
     assert.deepEqual(M.sshOptsFor('unconfigured', null), ['-o', 'BatchMode=yes']);
-    assert.deepEqual(M.sshOptsFor('alive', null), ['-o', 'BatchMode=yes'], 'no pinned path → no ProxyCommand=false');
+  });
+  test('alive master without a usable ControlPath is refused locally unless HPC_ALLOW_UNSAFE_REUSE (F1)', () => {
+    assert.throws(() => M.sshOptsFor('alive', null, { reason: 'fake: x', allowUnsafe: false, requireMaster: false }),
+      /^Error: ControlMaster detected but its ControlPath could not be resolved safely \(fake: x\); refusing to open a new connection\. Set HPC_ALLOW_UNSAFE_REUSE=1 to override\.$/);
+    // Default (env unset in this process) is fail-local too.
+    assert.throws(() => M.sshOptsFor('alive', null), /refusing to open a new connection/);
+    assert.deepEqual(M.sshOptsFor('alive', null, { allowUnsafe: true, requireMaster: false }), ['-o', 'BatchMode=yes'], 'override: plain BatchMode');
+    assert.throws(() => M.sshOptsFor('alive', null, { allowUnsafe: true, requireMaster: true }), /not honored while HPC_REQUIRE_MASTER=1/);
+    assert.deepEqual(M.sshOptsFor('unconfigured', null, { allowUnsafe: false }), ['-o', 'BatchMode=yes'], 'direct mode never throws');
+  });
+  test('ControlPath with a space: double-quoted for ssh -o, single-quoted in rsync -e (F1)', () => {
+    const a = M.sshOptsFor('alive', '/Users/u/Library/Application Support/cm');
+    assert.deepEqual(a, ['-o', 'BatchMode=yes', '-o', 'ControlPath="/Users/u/Library/Application Support/cm"', '-o', 'ProxyCommand=false']);
+    assert.equal(M.rsyncSshCommand(a), `ssh -o BatchMode=yes -o 'ControlPath="/Users/u/Library/Application Support/cm"' -o ProxyCommand=false`);
+    assert.equal(M.rsyncSshCommand(['-o', 'BatchMode=yes']), 'ssh -o BatchMode=yes');
+  });
+  test('controlPathProblem names the reason (F1)', () => {
+    assert.match(M.controlPathProblem('controlpath /s/%C\n'), /unexpanded "%" token/);
+    assert.equal(M.controlPathProblem('controlpath /a b/c\n'), null);
+    assert.match(M.controlPathProblem('controlpath /a"b\n'), /quotes, backslashes, tabs/);
+    assert.match(M.controlPathProblem('controlpath none\n'), /controlpath none/);
+    assert.match(M.controlPathProblem('hostname x\n'), /no controlpath/);
+    assert.equal(M.controlPathProblem('controlpath /s/cm\n'), null);
   });
   test('ControlPath from ssh -G output (%C-hashed path with ProxyJump)', () => {
     const g = 'hostname superpod.example.edu\ncontrolmaster auto\ncontrolpath /Users/u/.ssh/sockets/ssh_mux_e090d0f7\nproxyjump bastion\n';
     assert.equal(M.parseControlPath(g), '/Users/u/.ssh/sockets/ssh_mux_e090d0f7');
     assert.equal(M.parseControlPath('controlpath none\n'), null);
     assert.equal(M.parseControlPath('hostname x\n'), null);
-    assert.equal(M.parseControlPath('controlpath /a b/c\n'), null, 'whitespace would split rsync -e');
+    assert.equal(M.parseControlPath('controlpath /a b/c\n'), '/a b/c', 'inner spaces are quoted by sshOptsFor / rsyncSshCommand');
+    assert.equal(M.parseControlPath('controlpath /a\tb\n'), null);
+    assert.equal(M.parseControlPath("controlpath /a'b\n"), null);
+    assert.equal(M.parseControlPath('controlpath /a/b \n'), null, 'trailing whitespace');
     assert.equal(M.parseControlPath('controlpath /a/%h\n'), null, '% would be re-expanded');
   });
 });
@@ -822,5 +918,79 @@ describe('formatWatchLine (C14)', () => {
     const now = Date.parse('2026-01-01T01:00:00Z');
     const w = { jobId: '7', jobName: 'n', state: 'RUNNING', progress: '1/2', submittedAt: '2026-01-01T00:30:00Z', estimatedSeconds: 3600 };
     assert.equal(M.formatWatchLine(w, now), '  7 (n) [RUNNING tasks done 1/2] — 30min elapsed, est. 60min, ~50%');
+  });
+});
+
+// ---- Final review, Gemini items (G1-G7) ----
+
+describe('isUsableLogPath (G1)', () => {
+  test('Slurm "no file" markers and placeholders are not usable', () => {
+    for (const p of ['', '|', '-', '(null)', '(NULL)', '(none)', '/dev/null', ' /dev/null ', '/w/slurm_%j.out', null, undefined])
+      assert.equal(M.isUsableLogPath(p), false, JSON.stringify(p));
+    for (const p of ['/w/logs/slurm_541806.out', '/scratch/a=b/my log.out'])
+      assert.equal(M.isUsableLogPath(p), true, p);
+  });
+});
+
+describe('withFileLock release (G3)', () => {
+  test('an owner-less lock dir at release time (new holder mid-acquire) is not deleted', () => {
+    const p = join(HOME, 'g3', 'state.json');
+    mkdirSync(dirname(p), { recursive: true });
+    const lockDir = `${p}.lock`;
+    M.withFileLock(p, () => {
+      // Our lock was (wrongly) reclaimed and another process has just done
+      // mkdir, but not yet written its owner.json.
+      rmSync(lockDir, { recursive: true, force: true });
+      mkdirSync(lockDir);
+    });
+    assert.equal(existsSync(lockDir), true, 'the other holder\'s lock survives');
+    rmSync(lockDir, { recursive: true, force: true });
+  });
+  test('our own lock is still removed', () => {
+    const p = join(HOME, 'g3', 'own.json');
+    M.withFileLock(p, () => { assert.equal(existsSync(join(`${p}.lock`, M.LOCK_OWNER_FILE)), true); });
+    assert.equal(existsSync(`${p}.lock`), false);
+  });
+});
+
+describe('sacct output buffer (G4)', () => {
+  test('32 MB limit; overflow errors read as "output exceeded"', () => {
+    assert.equal(M.SACCT_MAX_BUFFER, 32 * 1024 * 1024);
+    const e = Object.assign(new Error('stdout maxBuffer length exceeded'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' });
+    assert.equal(M.describeExecError(e, M.SACCT_MAX_BUFFER, '3 watched job(s) in one sacct query'),
+      'output exceeded 32 MB (3 watched job(s) in one sacct query) — too many array tasks/steps for one query');
+    assert.match(M.describeExecError(Object.assign(new Error('spawnSync ssh ENOBUFS'), { code: 'ENOBUFS' }), M.SACCT_MAX_BUFFER), /^output exceeded 32 MB/);
+    assert.equal(M.describeExecError(new Error('Command failed: ssh x'), M.SACCT_MAX_BUFFER), 'Command failed: ssh x');
+  });
+});
+
+describe('per-cluster SLURM_DEFAULT_PARTITION / SLURM_DEFAULT_GPUS (G5)', () => {
+  test('parseDefaultGpus: single value, list, empty entries, invalid', () => {
+    assert.deepEqual(M.parseDefaultGpus(undefined), [1]);
+    assert.deepEqual(M.parseDefaultGpus(''), [1]);
+    assert.deepEqual(M.parseDefaultGpus('0'), [0]);
+    assert.deepEqual(M.parseDefaultGpus('0,2'), [0, 2]);
+    assert.deepEqual(M.parseDefaultGpus('0,,4'), [0, 1, 4]);
+    assert.equal(M.parseDefaultGpus('-1'), null);
+    assert.equal(M.parseDefaultGpus('1,x'), null);
+    assert.equal(M.parseDefaultGpus('1.5'), null);
+  });
+  test('pickPerCluster: HPC_HOST order, single value for all, last entry covers the rest', () => {
+    const hosts = ['mp', 'm3', 'other'];
+    assert.equal(M.pickPerCluster(['batch'], hosts, 'm3'), 'batch');
+    assert.equal(M.pickPerCluster(['batch', 'standard-s'], hosts, 'mp'), 'batch');
+    assert.equal(M.pickPerCluster(['batch', 'standard-s'], hosts, 'm3'), 'standard-s');
+    assert.equal(M.pickPerCluster(['batch', 'standard-s'], hosts, 'other'), 'standard-s');
+    assert.equal(M.pickPerCluster([0, 2], hosts, 'unknown'), 0);
+  });
+});
+
+describe('parsePartitionLines (G6)', () => {
+  test('QoS= and QOS= are both read; AllowQos= is not a QoS', () => {
+    const t = ['PartitionName=a AllowQos=ALL MaxTime=04:00:00 QoS=shortqos State=UP',
+      'PartitionName=b AllowQos=ALL MaxTime=2-00:00:00 QOS=gpuqos State=UP',
+      'PartitionName=c AllowQos=special MaxTime=UNLIMITED QOS=N/A State=UP'].join('\n');
+    const p = M.parsePartitionLines(t);
+    assert.deepEqual(p.map(x => [x.partition, x.qos, x.maxTimeSec]), [['a', 'shortqos', 14400], ['b', 'gpuqos', 172800], ['c', null, null]]);
   });
 });

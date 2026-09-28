@@ -89,8 +89,8 @@ Submit a SLURM batch job with automatic resource checking.
 |------|------|:---:|---------|-------------|
 | script | string | ✅ | — | Main command(s) to run |
 | job_name | string | ❌ | slurm-job | Job name, `[A-Za-z0-9_.-]{1,64}` |
-| partition | string | ❌ | `SLURM_DEFAULT_PARTITION` or batch | SLURM partition (`[A-Za-z0-9_.-]+`, e.g. `gpu.a100`, no leading `-`). See `cluster_info` for per-user caps |
-| gpus | number | ❌ | `SLURM_DEFAULT_GPUS` or 1 | Number of GPUs (non-negative integer; 0 = no `--gres` line; some sites reject 0). If sbatch rejects the GPU request, the error suggests `SLURM_DEFAULT_GPUS=0` / `gpus: 0` |
+| partition | string | ❌ | `SLURM_DEFAULT_PARTITION` (per-cluster list allowed) or batch | SLURM partition (`[A-Za-z0-9_.-]+`, e.g. `gpu.a100`, no leading `-`). See `cluster_info` for per-user caps |
+| gpus | number | ❌ | `SLURM_DEFAULT_GPUS` (per-cluster list allowed) or 1 | Number of GPUs (non-negative integer; 0 = no `--gres` line; some sites reject 0). If sbatch rejects the GPU request, the error suggests `SLURM_DEFAULT_GPUS=0` / `gpus: 0` |
 | mem | string | ❌ | 4G | Memory, `^\d+[KMGT]?$` |
 | time | string | ❌ | 00:15:00 | Time limit: `M`, `M:S`, `H:M:S`, `D-H`, `D-H:M`, `D-H:M:S` (surrounding whitespace is trimmed) |
 | cpus_per_task | number | ❌ | — | CPUs per task (non-negative integer) |

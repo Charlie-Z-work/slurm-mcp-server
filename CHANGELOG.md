@@ -212,6 +212,60 @@ All notable changes to this project are documented here. The format follows
   `FAKE_DELAY_MS` (blocking-call tests) and prints `scontrol show job -o`
   shaped output.
 
+### Fixed (final review)
+- ControlMaster alive but its ControlPath cannot be resolved safely (`ssh -G`
+  fails, or the path holds `%`, quotes, backslashes, tabs or leading/trailing
+  whitespace): every ssh/rsync call and the poller now refuse locally
+  ("ControlMaster detected but its ControlPath could not be resolved safely
+  (...); refusing to open a new connection") instead of falling back to plain
+  BatchMode, which would open a new connection if the master died.
+  `HPC_ALLOW_UNSAFE_REUSE=1` restores the fallback; never under
+  `HPC_REQUIRE_MASTER=1`. A ControlPath with plain spaces is now usable: it is
+  passed as `ControlPath="<path>"` to ssh and single-quoted inside `rsync -e`.
+- Watch expiry is decided only by the poller, never when the watch file is
+  loaded, and only when the cluster's sacct succeeded and the job is absent
+  again in a continuous series of successful queries (`lastQueriedAt`, gap
+  ≤ 20 min). The first successful query after an outage restarts the absence
+  clock instead of expiring the watch.
+- The heartbeat is written atomically (tmp + rename).
+- `slurm_submit` rejects a final log directory (stored workdir + `output_dir`)
+  containing `%`; `workdir_set` rejects `%`.
+- `sync_files` passes `-s` (protect-args) when the local rsync supports it
+  (probed once with `rsync -s --version`; macOS openrsync has no `-s`) and
+  rejects whitespace in `remote_path`.
+- Sites without Slurm accounting: a sacct error mentioning "accounting
+  storage" / "slurmdbd" marks the cluster for 1h; `slurm_submit` /
+  `slurm_submit_file` then register no watch and say "sacct unavailable on
+  this cluster — job watches cannot complete; use slurm_status", and
+  `slurm_watches` shows the reason.
+- Invalid `submittedAt` / `lastSeenAt` / `unseenSince` / `lastQueriedAt`
+  values in the watch file are treated as "now" (logged) and persisted by the
+  poller, so adoption and expiry can trigger again.
+- Watches whose host is not in `HPC_HOST` are neither polled, probed nor
+  adopted (no direct connections to unknown hosts); `slurm_watches` marks them
+  "not configured".
+- A watch `tty` must match `[\w.-]+` (it becomes a heartbeat file name).
+- `slurm_logs` treats `(null)`, `(none)`, `/dev/null` and `-` as "no log path"
+  and continues with the fallbacks.
+- `ssh_write_file` accepts `content: ""` (writes an empty file).
+- `withFileLock` no longer deletes an owner-less lock directory on release
+  (another process between its mkdir and its owner write).
+- The poller's batched sacct and the resource-history `sacct -j` use a 32 MB
+  output buffer (big arrays); an overflow is reported as "output exceeded 32 MB
+  (...)" instead of a bare Node error.
+- `SLURM_DEFAULT_PARTITION` and `SLURM_DEFAULT_GPUS` accept comma-separated
+  per-cluster lists in `HPC_HOST` order (a single value applies to all).
+- Partition QoS is read case-insensitively (`QOS=` on some Slurm versions).
+- A successful `ssh_exec` or an alive `ssh_status` ends the poller's backoff
+  for that cluster.
+- The unused helper `checkJobStateAsync` no longer connects when the master is
+  dead (same fail-fast rule as every other ssh path).
+- Offline tests: fake ssh scenario `sacct_disabled` and knobs
+  `FAKE_SSH_G_FAIL`, `FAKE_DEAD_FILE`, `FAKE_RUNNING_UNTIL`,
+  `FAKE_SACCT_PAD_MB`, `FAKE_STDOUT=null`; fake rsync answers the `-s` probe
+  (`FAKE_RSYNC_NO_S=1` mimics openrsync). New protocol test: a legacy
+  `{tty, workdir}` workdir file yields `cd -- '<dir>'` in the job script.
+
 ## 2.2.0 - 2026-09-27
 
 ### Added

@@ -4,7 +4,8 @@
 // command with output copied from a real SLURM cluster.
 //
 // Scenarios ($FAKE_SCENARIO): normal (default) | array | cancelled_by |
-// master_dead | master_unconfigured | sbatch_fail.
+// master_dead | master_unconfigured | sbatch_fail | sacct_disabled (every sacct
+// fails like on a site without Slurm accounting).
 // Extra knobs (env, all optional):
 //   FAKE_SCENARIO_BY_HOST=hostA:master_dead,hostB:normal  per-host scenario
 //                               (overrides FAKE_SCENARIO for those hosts)
@@ -24,10 +25,17 @@
 //                               (default /tmp/fake-cm/<host>)
 //   FAKE_DELAY_MS=<ms>          remote commands (not `-O check`) sleep this long
 //                               before answering (blocking-call tests)
+//   FAKE_SSH_G_FAIL=1           `ssh -G` exits 255 (unreadable ssh config)
+//   FAKE_DEAD_FILE=<path>       master is dead while this file exists
+//                               (outage → reconnect within one server's life)
+//   FAKE_RUNNING_UNTIL=<path>   plain jobs report RUNNING until this file exists
+//   FAKE_SACCT_PAD_MB=<n>       the poll sacct appends ~n MB of step rows
+//                               (huge array jobs)
+//   FAKE_STDOUT=null            sacct StdOut reports "(null)"
 // Array state machine: sacct reports task 2 RUNNING until either the file named
 // by $FAKE_ARRAY_GATE exists (deterministic mode for tests) or, when no gate is
 // set, until the second sacct poll.
-const { appendFileSync, existsSync, readFileSync, writeFileSync } = require('node:fs');
+const { appendFileSync, existsSync, readFileSync, writeFileSync, writeSync } = require('node:fs');
 
 const argv = process.argv.slice(2);
 // Host: `ssh -O check <host>` or `ssh [opts] <host> <command>`.
@@ -43,8 +51,20 @@ function readStdin() {
 function log(entry) {
   if (LOG) appendFileSync(LOG, JSON.stringify({ scenario, argv, ...entry }) + '\n');
 }
+// Synchronous full write: process.exit right after an async pipe write can
+// truncate multi-MB output (the G4 large-sacct tests).
+function writeAll(fd, str) {
+  const buf = Buffer.from(str);
+  let off = 0;
+  while (off < buf.length) {
+    try { off += writeSync(fd, buf, off); } catch (e) {
+      if (e.code !== 'EAGAIN') throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+    }
+  }
+}
 function out(text, code = 0, err = '') {
-  if (text) process.stdout.write(text.endsWith('\n') ? text : text + '\n');
+  if (text) writeAll(1, text.endsWith('\n') ? text : text + '\n');
   if (err) process.stderr.write(err.endsWith('\n') ? err : err + '\n');
   process.exit(code);
 }
@@ -53,6 +73,7 @@ function out(text, code = 0, err = '') {
 // ControlPath). Unconfigured hosts report "controlpath none". ---
 if (argv[0] === '-G') {
   log({ kind: 'config' });
+  if (process.env.FAKE_SSH_G_FAIL === '1') out('', 255, 'ssh: /home/u/.ssh/config line 3: Bad configuration option: bogus');
   const h = argv[1];
   const sc = byHost[h] || process.env.FAKE_SCENARIO || 'normal';
   if (process.env.FAKE_CONTROLPATH === 'none' || sc === 'master_unconfigured') out('hostname x\ncontrolpath none\n');
@@ -64,7 +85,8 @@ if (oi >= 0) {
   const op = argv[oi + 1];
   log({ kind: 'control', op });
   const dead = (process.env.FAKE_DEAD_HOSTS || '').split(',').filter(Boolean);
-  if (scenario === 'master_dead' || dead.includes(host)) {
+  const deadFile = process.env.FAKE_DEAD_FILE;
+  if (scenario === 'master_dead' || dead.includes(host) || (deadFile && existsSync(deadFile))) {
     out('', 255, 'Control socket connect(/tmp/cm-fake): No such file or directory');
   }
   if (scenario === 'master_unconfigured') {
@@ -113,9 +135,22 @@ function sacctPollRows(ids) {
       else rows.push('541822_2|RUNNING', '541822_2.batch|RUNNING', '541822_2.extern|RUNNING');
     } else if (scenario === 'cancelled_by' && id === '541900') {
       rows.push('541900|CANCELLED by 12345', '541900.batch|CANCELLED', '541900.extern|COMPLETED');
+    } else if (process.env.FAKE_RUNNING_UNTIL && !existsSync(process.env.FAKE_RUNNING_UNTIL)) {
+      rows.push(`${id}|RUNNING`, `${id}.batch|RUNNING`, `${id}.extern|RUNNING`);
     } else {
       rows.push(`${id}|COMPLETED`, `${id}.batch|COMPLETED`, `${id}.extern|COMPLETED`);
     }
+  }
+  const padMb = Number(process.env.FAKE_SACCT_PAD_MB) || 0;
+  if (padMb > 0 && ids.length) {
+    const pad = [];
+    let bytes = 0;
+    for (let i = 0; bytes < padMb * 1048576; i++) {
+      const row = `${ids[0]}.${i}|COMPLETED`;
+      pad.push(row);
+      bytes += row.length + 1;
+    }
+    for (const row of pad) rows.push(row); // no spread: 300k+ arguments overflow the stack
   }
   return rows.join('\n');
 }
@@ -127,6 +162,10 @@ const PARTITIONS = [
 const QOS = { shortqos: { Name: 'shortqos', MaxJobsPU: '1', MaxSubmitPU: '', MaxTRESPU: 'cpu=32,gres/gpu=2,mem=256G', MaxWall: '' } };
 
 let r;
+if (scenario === 'sacct_disabled' && /^sacct\b/.test(cmd)) {
+  // Real message on a site with AccountingStorageType=accounting_storage/none.
+  out('', 1, 'sacct: error: Slurm accounting storage is disabled');
+}
 if (/\|\s*sbatch\b/.test(cmd) || /^sbatch\s/.test(cmd)) {
   if (scenario === 'sbatch_fail') {
     if (process.env.FAKE_SBATCH_ERR === 'gres') out('', 1, 'sbatch: error: Invalid generic resource (gres) specification');
@@ -158,6 +197,7 @@ if (/\|\s*sbatch\b/.test(cmd) || /^sbatch\s/.test(cmd)) {
 } else if ((r = cmd.match(/^sacct -j '([^']+)' --format=StdOut/))) {
   if (process.env.FAKE_STDOUT === 'placeholder') out('/home/u/proj/results/logs/slurm_%j.out');
   if (process.env.FAKE_STDOUT === 'empty') out('');
+  if (process.env.FAKE_STDOUT === 'null') out('(null)');
   out(`/home/u/proj/results/logs/slurm_${r[1]}.out`);
 } else if (/^scontrol show job -o '/.test(cmd)) {
   // One-line records as printed by `scontrol show job -o`, one per path

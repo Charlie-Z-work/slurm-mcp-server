@@ -53,7 +53,7 @@ Partition availability varies by cluster. Common patterns:
 | short/debug | Quick tests | Often limited to 1-2 concurrent jobs |
 | gpu | GPU jobs | May require `--gres=gpu:N` |
 
-Choose the partition per job with the `partition` parameter of `slurm_submit` (default `batch`, or the `SLURM_DEFAULT_PARTITION` env var), or put it in a saved template. `gpus` defaults to 1 (`SLURM_DEFAULT_GPUS`); sites without GPUs: set `SLURM_DEFAULT_GPUS=0` so no `--gres` line is written. `HPC_PREAMBLE` only injects shell lines into the job body — it cannot change the partition.
+Choose the partition per job with the `partition` parameter of `slurm_submit` (default `batch`, or the `SLURM_DEFAULT_PARTITION` env var — a comma-separated list sets one default per cluster in `HPC_HOST` order), or put it in a saved template. `gpus` defaults to 1 (`SLURM_DEFAULT_GPUS`); sites without GPUs: set `SLURM_DEFAULT_GPUS=0` so no `--gres` line is written. `HPC_PREAMBLE` only injects shell lines into the job body — it cannot change the partition.
 
 **How to check per-user caps:** run `cluster_info` — its `Per-user limits` section lists `MaxTime`, `MaxJobsPU` (max running jobs per user) and `MaxTRESPU` (per-user cpu/gpu/mem cap) for every partition. `slurm_submit` also prints a ⚠️ hint when a request hits one of these caps.
 

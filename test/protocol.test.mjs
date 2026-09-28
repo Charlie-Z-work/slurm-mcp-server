@@ -1291,6 +1291,13 @@ describe('rsync protect-args and remote_path whitespace (F5)', () => {
         assert.equal(r.isError, true, remote_path);
         assert.match(r.text, /remote_path contains (whitespace|unsafe characters)/);
       }
+      // quotes / globs would be expanded by the remote shell when -s is missing:
+      // `/data/""` → /data/ and --delete would prune the wrong directory.
+      for (const remote_path of ['/data/""', '/data/*', '~/x/{a,b}']) {
+        const r = await s.call('sync_files', { direction: 'upload', local_path: '/tmp/x', remote_path, delete: true });
+        assert.equal(r.isError, true, remote_path);
+        assert.match(r.text, /remote_path may only contain/);
+      }
       assert.equal(s.logEntries().filter(e => e.kind === 'rsync').length, 1, 'no rsync for rejected paths');
     } finally { await s.stop(); }
   });

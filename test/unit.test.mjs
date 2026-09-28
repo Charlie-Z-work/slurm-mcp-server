@@ -680,14 +680,17 @@ describe('heartbeat atomic write (F3)', () => {
 });
 
 describe('sacct availability (F6)', () => {
-  test('only accounting-storage / slurmdbd errors mark a host; entries expire after 1h', () => {
+  test('only "accounting storage is disabled" marks a host (transient slurmdbd errors do not); entries expire after 1h', () => {
     const t0 = Date.now();
     assert.equal(M.noteSacctError('h1', 'sacct: error: Problem talking to the database: Connection refused', t0), false);
     assert.equal(M.sacctUnavailableFor('h1', t0), null);
     assert.equal(M.noteSacctError('h1', 'Command failed\nsacct: error: Slurm accounting storage is disabled\n', t0), true);
     assert.equal(M.sacctUnavailableFor('h1', t0).reason, 'sacct: error: Slurm accounting storage is disabled');
-    assert.equal(M.noteSacctError('h2', 'sacct: error: slurm_persist_conn_open_without_init: failed to open persistent connection to host:slurmdbd:6819', t0), true);
-    assert.equal(M.sacctUnavailableFor('h2', t0 + 3601_000), null, 'expired');
+    // transient slurmdbd outage: NOT a configured absence of accounting → no mark
+    assert.equal(M.noteSacctError('h2', 'sacct: error: slurm_persist_conn_open_without_init: failed to open persistent connection to host:slurmdbd:6819', t0), false);
+    assert.equal(M.sacctUnavailableFor('h2', t0), null);
+    assert.equal(M.noteSacctError('h3', 'AccountingStorageType=accounting_storage/none', t0), true);
+    assert.equal(M.sacctUnavailableFor('h3', t0 + 3601_000), null, 'expired');
     assert.match(M.SACCT_UNAVAILABLE_NOTE, /^⚠️ sacct unavailable on this cluster — job watches cannot complete; use slurm_status$/);
   });
 });
@@ -992,5 +995,16 @@ describe('parsePartitionLines (G6)', () => {
       'PartitionName=c AllowQos=special MaxTime=UNLIMITED QOS=N/A State=UP'].join('\n');
     const p = M.parsePartitionLines(t);
     assert.deepEqual(p.map(x => [x.partition, x.qos, x.maxTimeSec]), [['a', 'shortqos', 14400], ['b', 'gpuqos', 172800], ['c', null, null]]);
+  });
+});
+
+describe('remote_path allowlist (final review)', () => {
+  test('quotes and glob characters are rejected; plain paths pass', () => {
+    for (const bad of ['/data/""', "/data/'x'", '/data/*', '/data/?.txt', '/data/[ab]', '/data/{a,b}', '/data/$HOME', '/data/a;b']) {
+      assert.equal(M.RE_REMOTE_PATH.test(bad), false, bad);
+    }
+    for (const ok of ['~/proj/run-1', '/users/u/dir.v2/file+x@y', '~', '/scratch/a_b']) {
+      assert.equal(M.RE_REMOTE_PATH.test(ok), true, ok);
+    }
   });
 });

@@ -61,6 +61,8 @@ function shq(s) {
 
 // Path validation: block shell metacharacters and traversal
 const UNSAFE_PATH = /[;|$()&<>`\n\t\r\\]/;
+// remote_path for rsync: strict allowlist (see sync_files); a leading ~ is allowed.
+const RE_REMOTE_PATH = /^(?!$)~?[\w.\/+@-]*$/; // non-empty; bare ~ allowed
 function validatePath(p, label) {
   if (UNSAFE_PATH.test(p)) return `${label} contains unsafe characters`;
   if (p.includes('..')) return `${label} contains '..' (path traversal not allowed)`;
@@ -831,7 +833,12 @@ function hostConfigured(host) {
 // watch and says so. Kept for SACCT_UNAVAILABLE_TTL_MS so that a transient
 // slurmdbd outage does not disable watches for the rest of the session; any
 // successful sacct of the host clears it.
-const SACCT_UNAVAILABLE_RE = /accounting storage|slurmdbd|Slurm accounting storage is disabled/i;
+// Why: only a *configured* absence of accounting suppresses watch registration.
+// A transient slurmdbd outage ("failed to open persistent connection",
+// "Problem talking to the database") must keep registering watches — the
+// poller retries with backoff and the job history is still there once the
+// daemon is back (final-review finding).
+const SACCT_UNAVAILABLE_RE = /accounting storage is disabled|accounting_storage\/none/i;
 const SACCT_UNAVAILABLE_TTL_MS = 3600_000;
 const sacctUnavailable = new Map(); // host → { at, reason }
 function noteSacctError(host, text, now = Date.now()) {
@@ -2067,6 +2074,7 @@ server.tool('slurm_submit',
   try {
     const rh = queryResourceHistory(args.job_name);
     const hist = rh.status === 'ok' ? parseResourceHistory(rh.text) : null;
+    if (rh.status === 'ok') sacctUnavailable.delete(SSH_HOST); // accounting is evidently working
     if (hist) {
       resourceInfo = formatRecommendation(hist) + checkResourceWaste(args.mem, args.time, hist);
     } else if (rh.status === 'error') {
@@ -2536,7 +2544,12 @@ server.tool('sync_files', 'Sync files between local and HPC via rsync', {
   // Whitespace is rejected in remote_path (like the other UNSAFE_PATH
   // characters): without protect-args (-s) the remote shell splits it, and
   // openrsync (macOS default) has no -s.
-  const remoteErr = validatePath(args.remote_path, 'remote_path') || (/\s/.test(args.remote_path) ? 'remote_path contains whitespace' : null);
+  // Why the allowlist (beyond UNSAFE_PATH): without protect-args the remote
+  // shell expands quotes and globs in the path — `/data/""` becomes /data/ and
+  // `--delete` would then prune the wrong directory (final-review finding).
+  const remoteErr = validatePath(args.remote_path, 'remote_path')
+    || (/\s/.test(args.remote_path) ? 'remote_path contains whitespace' : null)
+    || (!RE_REMOTE_PATH.test(args.remote_path) ? 'remote_path may only contain letters, digits, and . / _ - + @ ~ (no quotes or glob characters)' : null);
   if (remoteErr) return { content: [{ type: 'text', text: remoteErr }], isError: true };
   const localPath = expandLocalHome(args.local_path);
   if (!localPath.startsWith('/')) {
@@ -2823,6 +2836,7 @@ if (process.env.SLURM_MCP_NO_START !== '1') {
 }
 
 export {
+  RE_REMOTE_PATH,
   parseSacctJobId, countTasksInKey, summarizeJobRows, baseState, isTerminalState, TERMINAL_STATES,
   parseSlurmTime, parseElapsed, parseResourceHistory, formatRecommendation, checkResourceWaste,
   memToMB, parseTres, validateSubmitArgs, RE_JOB_NAME, RE_PARTITION, RE_MEM, RE_ARRAY, RE_DEPENDENCY,
